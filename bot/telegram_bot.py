@@ -4,6 +4,9 @@ import asyncio
 import logging
 import os
 import io
+import re
+
+from pylatexenc.latex2text import LatexNodes2Text
 
 from uuid import uuid4
 from telegram import BotCommandScopeAllGroupChats, Update, constants
@@ -570,6 +573,7 @@ class ChatGPTTelegramBot:
                             continue
 
                     elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        content = self.replace_math_expressions(content)
                         prev = content
 
                         try:
@@ -737,6 +741,7 @@ class ChatGPTTelegramBot:
                             continue
 
                     elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        content = self.replace_math_expressions(content)
                         prev = content
 
                         try:
@@ -1082,3 +1087,17 @@ class ChatGPTTelegramBot:
         application.add_error_handler(error_handler)
 
         application.run_polling()
+
+    def replace_math_expressions(self, content):
+        """
+        Convert latex to text
+        """
+        converter = LatexNodes2Text(math_mode='text')
+        text = converter.latex_to_text(content)
+        # bugfix for code
+        text = re.sub(r'“`', '```', text)
+        # Remove spaces at the beginning of the line before numbers
+        text = re.sub(r'^\s+(?=[\d(])', '\n', text, flags=re.MULTILINE)
+        # Replacing triple or more line breaks
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text
