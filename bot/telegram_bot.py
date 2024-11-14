@@ -1098,4 +1098,6 @@ class ChatGPTTelegramBot:
         text = re.sub(r'“`', '```', text)
         # Remove spaces at the beginning of the line before numbers
         text = re.sub(r'^\s+(?=[\d(])', '\n', text, flags=re.MULTILINE)
+        # Replacing triple or more line breaks
+        text = re.sub(r'\n{3,}', '\n\n', text)
         return text
