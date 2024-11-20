@@ -77,6 +77,9 @@ class Reminder(Plugin):
         }, {
             "name": "start_reminders_task",
             "description": "Enable reminder checking",
+        }, {
+            "name": "get_reminders_for_current_chat",
+            "description": "Get all reminders for the current chat",
         }]
 
     def get_current_time(self):
@@ -133,17 +136,6 @@ class Reminder(Plugin):
     def add_multiple_reminders(self):
         return {"error": "You cannot add multiple reminders at once."}
 
-    def start_reminders_task(self):
-        """
-        Starts the reminder checking task if it is not already running.
-        """
-        self.reminders = self.load_reminders()
-        if not self.checking_task or self.checking_task.done():
-            self.checking_task = asyncio.create_task(self.check_and_send_reminders())
-            logging.info("Reminder checking task started.")
-        else:
-            logging.info("Reminder checking task is already running.")
-
     def remove_reminder(self, reminder_id: str):
         if reminder_id in self.reminders:
             self.reminders.pop(reminder_id)
@@ -193,6 +185,35 @@ class Reminder(Plugin):
             "repeat": reminder.get("repeat", "none")
         }
 
+    def get_reminders_for_current_chat(self, chat_id):
+        """
+        Get all reminders for the current chat
+        """
+        self.reminders = self.load_reminders()
+        reminders_for_chat = [
+            {
+                "reminder_id": r_id,
+                "message": reminder["message"],
+                "time": reminder["time"],
+                "repeat": reminder.get("repeat", "none")
+            }
+            for r_id, reminder in self.reminders.items()
+            if reminder["chat_id"] == chat_id
+        ]
+        logging.info(reminders_for_chat)
+        return reminders_for_chat
+
+    def start_reminders_task(self):
+        """
+        Starts the reminder checking task if it is not already running.
+        """
+        self.reminders = self.load_reminders()
+        if not self.checking_task or self.checking_task.done():
+            self.checking_task = asyncio.create_task(self.check_and_send_reminders())
+            logging.info("Reminder checking task started.")
+        else:
+            logging.info("Reminder checking task is already running.")
+
     async def check_and_send_reminders(self):
         while True:
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -231,19 +252,21 @@ class Reminder(Plugin):
             await asyncio.sleep(60)
 
     async def execute(self, function_name, helper, **kwargs) -> dict:
+        chat_user_info = helper.get_current_telegram_chat_user_info()
+
         if function_name == 'add_reminder':
             reminder_id = kwargs.get('reminder_id', str(uuid4()))
             message = kwargs.get('message', '')
             datetime_str = kwargs.get('datetime', '')
             repeat = kwargs.get('repeat', 'none')
-            return await self.add_reminder(reminder_id, helper.get_current_telegram_chat_id(), message, datetime_str, repeat)
+            return await self.add_reminder(reminder_id, chat_user_info.get("chat_id"), message, datetime_str, repeat)
 
         elif function_name == 'remove_reminder':
             reminder_id = kwargs.get('reminder_id', '')
             return self.remove_reminder(reminder_id)
 
         elif function_name == 'remove_reminders_for_current_chat':
-            return self.remove_reminders_for_current_chat(helper.get_current_telegram_chat_id())
+            return self.remove_reminders_for_current_chat(chat_user_info.get("chat_id"))
 
         elif function_name == 'start_reminders_task':
             return self.start_reminders_task()
@@ -259,5 +282,8 @@ class Reminder(Plugin):
             message = kwargs.get('message', None)
             datetime_str = kwargs.get('datetime', None)
             return self.edit_reminder(reminder_id, message, datetime_str)
+
+        elif function_name == 'get_reminders_for_current_chat':
+            return self.get_reminders_for_current_chat(chat_user_info.get("chat_id"))
 
         return {"error": "Unknown error"}
