@@ -117,6 +117,7 @@ class OpenAIHelper:
         self.conversations: dict[int: list] = {}  # {chat_id: history}
         self.conversations_vision: dict[int: bool] = {}  # {chat_id: is_vision}
         self.last_updated: dict[int: datetime] = {}  # {chat_id: last_update_timestamp}
+        self.telegram_chat_id = 0
 
     def get_conversation_stats(self, chat_id: int) -> tuple[int, int]:
         """
@@ -178,6 +179,7 @@ class OpenAIHelper:
         :param query: The query to send to the model
         :return: The answer from the model and the number of tokens used, or 'not_finished'
         """
+        self.telegram_chat_id = chat_id
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query, stream=True)
         if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
@@ -738,3 +740,9 @@ class OpenAIHelper:
     #     billing_data = json.loads(response.text)
     #     usage_month = billing_data["total_usage"] / 100  # convert cent amount to dollars
     #     return usage_month
+
+    def get_current_telegram_chat_id(self) -> int:
+        """
+        Get current telegram chat ID
+        """
+        return self.telegram_chat_id
