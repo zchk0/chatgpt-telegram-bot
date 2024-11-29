@@ -663,6 +663,8 @@ class ChatGPTTelegramBot:
         user_id = update.message.from_user.id
         prompt = message_text(update.message)
         self.last_message[chat_id] = prompt
+        if user_id not in self.usage:
+            self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
 
         if is_group_chat(update):
             trigger_keyword = self.config['group_trigger_keyword']
@@ -696,7 +698,8 @@ class ChatGPTTelegramBot:
                     query=prompt,
                     params={
                         'telegram_user_id': user_id,
-                        'telegram_user_name': update.message.from_user.name
+                        'telegram_user_name': update.message.from_user.name,
+                        'usage_tracker': self.usage[user_id]
                     }
                 )
                 i = 0
@@ -904,7 +907,8 @@ class ChatGPTTelegramBot:
                         query=query,
                         params={
                             'telegram_user_id': update.message.from_user.id,
-                            'telegram_user_name': update.message.from_user.name
+                            'telegram_user_name': update.message.from_user.name,
+                            'usage_tracker': self.usage[user_id]
                         }
                     )
                     i = 0

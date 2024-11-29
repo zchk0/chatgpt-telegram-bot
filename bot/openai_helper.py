@@ -120,6 +120,7 @@ class OpenAIHelper:
         self.current_telegram_chat_id = 0
         self.current_telegram_user_id = 0
         self.current_telegram_user_name = ""
+        self.usage_tracker = {}
 
     def get_conversation_stats(self, chat_id: int) -> tuple[int, int]:
         """
@@ -185,6 +186,7 @@ class OpenAIHelper:
         self.current_telegram_chat_id = chat_id
         self.current_telegram_user_id = params.get('telegram_user_id', 0)
         self.current_telegram_user_name = params.get('telegram_user_name', None)
+        self.usage_tracker = params.get('usage_tracker', {})
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query, stream=True)
         if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
@@ -754,4 +756,5 @@ class OpenAIHelper:
             "chat_id": self.current_telegram_chat_id,
             "user_id": self.current_telegram_user_id,
             "user_name": self.current_telegram_user_name,
+            "usage_tracker": self.usage_tracker
         }
