@@ -2,6 +2,7 @@ import os
 import datetime
 import json
 import asyncio
+import random
 from typing import Dict, Union
 from uuid import uuid4
 import logging
@@ -28,7 +29,17 @@ class Reminder(Plugin):
     def get_spec(self) -> [Dict]:
         return [{
             "name": "get_current_time",
-            "description": "Get the current time before creating and editing reminders",
+            "description": "Get the current time and user time zone before creating and editing reminders",
+        }, {
+            "name": "set_current_user_timezone",
+            "description": "Set time zone for current user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_timezone": {"type": "string", "description": "Time zone for the user in IANA format (e.g., 'Asia/Novokuznetsk', 'Europe/London')"},
+                }
+            },
+            "required": ["user_timezone"]
         }, {
             "name": "add_reminder",
             "description": "Create a single or recurring reminder",
@@ -82,8 +93,18 @@ class Reminder(Plugin):
             "description": "Get all reminders for the current chat",
         }]
 
-    def get_current_time(self):
-        return datetime.datetime.now(datetime.timezone.utc).astimezone()
+    def get_current_time(self, usage_tracker):
+        if usage_tracker.get_user_timezone() is None:
+            return {"error": "Time zone not set for working with reminders"}
+
+        return {
+            "server_time": datetime.datetime.now(datetime.timezone.utc).astimezone(),
+            "current_user_timezone": usage_tracker.get_user_timezone()
+        }
+
+    def set_current_user_timezone(self, usage_tracker, timezone):
+        usage_tracker.set_user_timezone(timezone)
+        return {"message": "Time zone for current user set successfully"}
 
     def load_reminders(self):
         """
@@ -219,12 +240,14 @@ class Reminder(Plugin):
             now = datetime.datetime.now(datetime.timezone.utc)
             to_remove = []
             for reminder_id, reminder in self.reminders.items():
-                remind_time = datetime.datetime.fromisoformat(reminder["time"]).astimezone()
+                remind_time = datetime.datetime.fromisoformat(reminder["time"])
+                if remind_time.tzinfo is None: # если тайм зона не передана
+                    remind_time = remind_time.replace(tzinfo=datetime.timezone.utc).astimezone()
                 chat_id = reminder["chat_id"]
                 message = reminder["message"]
 
                 if now >= remind_time:
-                    logging.info(f'send_remind {now}')
+                    logging.info(f'send_remind now: {now}, remind_time: {remind_time}')
                     try:
                         await self.bot.send_message(
                             chat_id=chat_id,
@@ -243,7 +266,14 @@ class Reminder(Plugin):
                     elif reminder["repeat"] == 'monthly':
                         next_month = (remind_time.month % 12) + 1
                         year = remind_time.year + (1 if next_month == 1 else 0)
-                        self.reminders[reminder_id]["time"] = remind_time.replace(year=year, month=next_month).isoformat()
+                        while True:
+                            try:
+                                self.reminders[reminder_id]["time"] = remind_time.replace(year=year, month=next_month).isoformat()
+                                break
+                            except ValueError: # Пропускаем месяц, если дата не существует
+                                next_month = (next_month % 12) + 1
+                                if next_month == 1:
+                                    year += 1
 
             for reminder_id in to_remove:
                 self.reminders.pop(reminder_id)
@@ -255,7 +285,7 @@ class Reminder(Plugin):
         chat_user_info = helper.get_current_telegram_chat_user_info()
 
         if function_name == 'add_reminder':
-            reminder_id = kwargs.get('reminder_id', str(uuid4()))
+            reminder_id = kwargs.get('reminder_id', str(uuid4()))+str(random.randint(1, 99))
             message = kwargs.get('message', '')
             datetime_str = kwargs.get('datetime', '')
             repeat = kwargs.get('repeat', 'none')
@@ -275,7 +305,10 @@ class Reminder(Plugin):
             return self.add_multiple_reminders()
         
         elif function_name == 'get_current_time':
-            return self.get_current_time()
+            return self.get_current_time(chat_user_info.get("usage_tracker"))
+        
+        elif function_name == 'set_current_user_timezone':
+            return self.set_current_user_timezone(chat_user_info.get("usage_tracker"), kwargs.get('user_timezone', None))
 
         elif function_name == 'edit_reminder':
             reminder_id = kwargs.get('reminder_id', '')
