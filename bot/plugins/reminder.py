@@ -51,8 +51,8 @@ class Reminder(Plugin):
                     "datetime": {"type": "string", "description": "ISO 8601 format date and time for the reminder"},
                     "repeat": {
                         "type": "string",
-                        "description": "Frequency of recurrence: 'daily', 'weekly', 'monthly', or 'none'",
-                        "enum": ["none", "daily", "weekly", "monthly"]
+                        "description": "Frequency of recurrence: 'daily', 'daily-till-month-end', 'weekly', 'monthly', or 'none'",
+                        "enum": ["none", "daily", "daily-till-month-end", "weekly", "monthly"]
                     }
                 },
                 "required": ["reminder_id", "message", "datetime"]
@@ -69,6 +69,11 @@ class Reminder(Plugin):
                     "reminder_id": {"type": "string", "description": "ID of the reminder"},
                     "message": {"type": "string", "description": "New reminder message"},
                     "datetime": {"type": "string", "description": "ISO 8601 format date and time for the reminder"},
+                    "repeat": {
+                        "type": "string",
+                        "description": "Frequency of recurrence: 'daily', 'daily-till-month-end', 'weekly', 'monthly', or 'none'",
+                        "enum": ["none", "daily", "daily-till-month-end", "weekly", "monthly"]
+                    }
                 },
                 "required": ["reminder_id"]
             },
@@ -172,7 +177,7 @@ class Reminder(Plugin):
         self.save_reminders()
         return {"message": f"All reminders removed successfully for current chat"}
 
-    def edit_reminder(self, reminder_id: str, message: str = None, datetime_str: str = None):
+    def edit_reminder(self, reminder_id: str, message: str = None, datetime_str: str = None, repeat: str = None):
         self.reminders = self.load_reminders()
         if reminder_id not in self.reminders:
             logging.info(f"Reminder with ID {reminder_id} does not exist")
@@ -188,6 +193,8 @@ class Reminder(Plugin):
                     server_timezone = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
                     remind_time = remind_time.replace(tzinfo=server_timezone)
                 reminder["time"] = remind_time.isoformat()
+                if "daily-till-month-end" in self.reminders[reminder_id]:
+                    reminder["daily-till-month-end"] = remind_time.day
             except ValueError:
                 logging.info('Invalid date format')
                 return {"error": "Invalid date format"}
@@ -195,6 +202,10 @@ class Reminder(Plugin):
         # Обновление сообщения, если указано новое значение
         if message:
             reminder["message"] = message
+
+        # Обновление частоты, если указано новое значение
+        if repeat:
+            reminder["repeat"] = repeat
 
         self.reminders[reminder_id] = reminder
         self.save_reminders()
@@ -261,6 +272,23 @@ class Reminder(Plugin):
                         to_remove.append(reminder_id)
                     elif reminder["repeat"] == 'daily':
                         self.reminders[reminder_id]["time"] = (remind_time + datetime.timedelta(days=1)).isoformat()
+                    elif reminder["repeat"] == 'daily-till-month-end':
+                        next_time = remind_time + datetime.timedelta(days=1)
+                        if "daily-till-month-end" not in self.reminders[reminder_id]:
+                            self.reminders[reminder_id]["daily-till-month-end"] = remind_time.day
+                        if next_time.month != remind_time.month:
+                            next_month = next_time.month
+                            year = next_time.year
+                            day = self.reminders[reminder_id]["daily-till-month-end"]
+                            while True:
+                                try:
+                                    next_time = remind_time.replace(year=year, month=next_month, day=day)
+                                    break
+                                except ValueError: # Пропускаем месяц, если дата не существует
+                                    next_month = (next_month % 12) + 1
+                                    if next_month == 1:
+                                        year += 1
+                        self.reminders[reminder_id]["time"] = next_time.isoformat()
                     elif reminder["repeat"] == 'weekly':
                         self.reminders[reminder_id]["time"] = (remind_time + datetime.timedelta(weeks=1)).isoformat()
                     elif reminder["repeat"] == 'monthly':
@@ -314,7 +342,8 @@ class Reminder(Plugin):
             reminder_id = kwargs.get('reminder_id', '')
             message = kwargs.get('message', None)
             datetime_str = kwargs.get('datetime', None)
-            return self.edit_reminder(reminder_id, message, datetime_str)
+            repeat = kwargs.get('repeat', None)
+            return self.edit_reminder(reminder_id, message, datetime_str, repeat)
 
         elif function_name == 'get_reminders_for_current_chat':
             return self.get_reminders_for_current_chat(chat_user_info.get("chat_id"))
