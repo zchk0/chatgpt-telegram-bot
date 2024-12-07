@@ -17,6 +17,7 @@ class UsageTracker:
     JSON example:
     {
         "user_name": "@user_name",
+        "user_timezone": "Europe/London",
         "current_cost": {
             "day": 0.45,
             "month": 3.23,
@@ -66,9 +67,25 @@ class UsageTracker:
             # create new dictionary for this user
             self.usage = {
                 "user_name": user_name,
+                "user_timezone": None,
                 "current_cost": {"day": 0.0, "month": 0.0, "all_time": 0.0, "last_update": str(date.today())},
                 "usage_history": {"chat_tokens": {}, "transcription_seconds": {}, "number_images": {}, "tts_characters": {}, "vision_tokens":{}}
             }
+
+    def set_user_timezone(self, timezone=None):
+        """
+        Add time zone for current user
+        """
+        self.usage["user_timezone"] = timezone
+        # write updated time zone to user file
+        with open(self.user_file, "w") as outfile:
+            json.dump(self.usage, outfile)
+
+    def get_user_timezone(self):
+        """
+        Get time zone for current user
+        """
+        return self.usage.get('user_timezone', None)
 
     # token usage functions:
 

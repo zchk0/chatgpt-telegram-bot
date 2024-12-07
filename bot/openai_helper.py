@@ -117,6 +117,10 @@ class OpenAIHelper:
         self.conversations: dict[int: list] = {}  # {chat_id: history}
         self.conversations_vision: dict[int: bool] = {}  # {chat_id: is_vision}
         self.last_updated: dict[int: datetime] = {}  # {chat_id: last_update_timestamp}
+        self.current_telegram_chat_id = 0
+        self.current_telegram_user_id = 0
+        self.current_telegram_user_name = ""
+        self.usage_tracker = {}
 
     def get_conversation_stats(self, chat_id: int) -> tuple[int, int]:
         """
@@ -171,13 +175,18 @@ class OpenAIHelper:
 
         return answer, response.usage.total_tokens
 
-    async def get_chat_response_stream(self, chat_id: int, query: str):
+    async def get_chat_response_stream(self, chat_id: int, query: str, params: dict):
         """
         Stream response from the GPT model.
         :param chat_id: The chat ID
         :param query: The query to send to the model
+        :param params: Additional parameters as a dictionary
         :return: The answer from the model and the number of tokens used, or 'not_finished'
         """
+        self.current_telegram_chat_id = chat_id
+        self.current_telegram_user_id = params.get('telegram_user_id', 0)
+        self.current_telegram_user_name = params.get('telegram_user_name', None)
+        self.usage_tracker = params.get('usage_tracker', {})
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query, stream=True)
         if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
@@ -738,3 +747,14 @@ class OpenAIHelper:
     #     billing_data = json.loads(response.text)
     #     usage_month = billing_data["total_usage"] / 100  # convert cent amount to dollars
     #     return usage_month
+
+    def get_current_telegram_chat_user_info(self) -> int:
+        """
+        Get current telegram chat and user info
+        """
+        return {
+            "chat_id": self.current_telegram_chat_id,
+            "user_id": self.current_telegram_user_id,
+            "user_name": self.current_telegram_user_name,
+            "usage_tracker": self.usage_tracker
+        }
