@@ -8,7 +8,7 @@ tenacity==8.3.0
 wolframalpha~=5.0.0
 duckduckgo_search==5.3.1b1
 spotipy~=2.23.0
-pytube~=15.0.0
+pytubefix~=8.8.4
 gtts~=2.5.1
 whois~=0.9.27
 Pillow~=10.3.0

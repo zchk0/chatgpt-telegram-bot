@@ -2,7 +2,7 @@ import logging
 import re
 from typing import Dict
 
-from pytube import YouTube
+from pytubefix import YouTube
 
 from .plugin import Plugin
 
