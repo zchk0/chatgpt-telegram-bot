@@ -1109,12 +1109,13 @@ class ChatGPTTelegramBot:
         """
         Convert latex to text
         """
-        converter = LatexNodes2Text(math_mode='text')
-        text = converter.latex_to_text(content)
-        # bugfix for code
-        text = re.sub(r'“`', '```', text)
+        if '```' not in content:
+            converter = LatexNodes2Text(math_mode='text')
+            content = converter.latex_to_text(content)
+            # bugfix for code
+            content = re.sub(r'“`', '```', content)
         # Remove spaces at the beginning of the line before numbers
-        text = re.sub(r'^\s+(?=[\d(])', '\n', text, flags=re.MULTILINE)
+        content = re.sub(r'^\s+(?=[\d(])', '\n', content, flags=re.MULTILINE)
         # Replacing triple or more line breaks
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        return text
+        content = re.sub(r'\n{3,}', '\n\n', content)
+        return content
