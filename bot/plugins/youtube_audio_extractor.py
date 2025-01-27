@@ -31,7 +31,7 @@ class YouTubeAudioExtractorPlugin(Plugin):
     async def execute(self, function_name, helper, **kwargs) -> Dict:
         link = kwargs['youtube_link']
         try:
-            video = YouTube(link)
+            video = YouTube(link, client='ANDROID')
             audio = video.streams.filter(only_audio=True, file_extension='mp4').first()
             output = re.sub(r'[^\w\-_\. ]', '_', video.title) + '.mp3'
             audio.download(filename=output)
