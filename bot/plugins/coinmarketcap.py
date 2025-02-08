@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Dict
 
@@ -21,34 +22,47 @@ class CoinMarketCap(Plugin):
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "asset": {"type": "string", "description": "Ticker of the cryptocurrency in uppercase (e.g., BTC, ETH, XRP)"}
+                    "asset": {"type": "string", "description": "Ticker of the cryptocurrency in uppercase (e.g., BTC, ETH, XRP)"},
+                    "currency": { "type": "string", "description": "Currency to convert (e.g. USD, RUB, etc.). Default is USD"}
                 },
                 "required": ["asset"],
             },
         }]
 
-    def get_crypto_price(self, asset):
+    def get_crypto_price(self, asset, currency="USD"):
         headers = {
             'X-CMC_PRO_API_KEY': os.environ.get('COINMARKETCAP_KEY', '')
         }
+        asset = asset.upper()
+        currency = currency.upper()
         params = {
+            'amount': 1,
             'symbol': asset,
-            'convert': 'USD'
+            'convert': currency
         }
         try:
-            response = requests.get("https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest", headers=headers, params=params)
+            response = requests.get(
+                "https://pro-api.coinmarketcap.com/v2/tools/price-conversion",
+                headers=headers,
+                params=params
+            )
             response.raise_for_status()
-            data = response.json().get('data', {})
-            if asset in data:
-                price = data[asset]['quote']['USD']['price']
-                return price
-            else:
-                return "Not found"
+            data = response.json()
+            if "data" in data:
+                conversion_data = data["data"]
+                if isinstance(conversion_data, list):
+                    for item in conversion_data:
+                        if "quote" in item and currency in item["quote"]:
+                            price = item["quote"][currency].get("price")
+                            if price is not None:
+                                return price
+            return "Not found"
         except requests.exceptions.RequestException as e:
-            print(f"An error occurred: {e}")
+            logging.info(f"An error occurred: {e}")
             return None
 
     async def execute(self, function_name, helper, **kwargs) -> dict:
         asset = kwargs.get('asset', '')
-        rate = self.get_crypto_price(asset)
-        return {"asset": asset, "rate": rate}
+        currency = kwargs.get('currency', 'USD')
+        rate = self.get_crypto_price(asset, currency)
+        return {"asset": asset, "currency": currency, "rate": rate}
