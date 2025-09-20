@@ -1,6 +1,6 @@
-# ChatGPT Telegram Bot
+# ChatGPT Telegram Bot by zchk0
 ![python-version](https://img.shields.io/badge/python-3.9-blue.svg)
-[![openai-version](https://img.shields.io/badge/openai-1.58.1-orange.svg)](https://openai.com/)
+[![openai-version](https://img.shields.io/badge/openai-1.108.0-orange.svg)](https://openai.com/)
 [![license](https://img.shields.io/badge/License-GPL%202.0-brightgreen.svg)](LICENSE)
 [![Publish Docker image](https://github.com/n3d1117/chatgpt-telegram-bot/actions/workflows/publish.yaml/badge.svg)](https://github.com/n3d1117/chatgpt-telegram-bot/actions/workflows/publish.yaml)
 
@@ -41,6 +41,7 @@ A [Telegram bot](https://core.telegram.org/bots/api) that integrates with OpenAI
 - [x] (NEW!) Text-to-speech support [announced on November 6, 2023](https://platform.openai.com/docs/guides/text-to-speech) - by [@gilcu3](https://github.com/gilcu3)
 - [x] (NEW!) Vision support [announced on November 6, 2023](https://platform.openai.com/docs/guides/vision) - by [@gilcu3](https://github.com/gilcu3)
 - [x] (NEW!) GPT-4o model support [announced on May 12, 2024](https://openai.com/index/hello-gpt-4o/) - by [@err09r](https://github.com/err09r)
+- [x] (NEW!) GPT-5, GPT-5 mini, GPT-5 nano support by zchk0
 
 ## Additional features - help needed!
 If you'd like to help, check out the [issues](https://github.com/n3d1117/chatgpt-telegram-bot/issues) section and contribute!  
