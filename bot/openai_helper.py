@@ -2,6 +2,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import uuid
 
 import tiktoken
 
@@ -24,11 +25,33 @@ GPT_3_MODELS = ("gpt-3.5-turbo", "gpt-3.5-turbo-0301", "gpt-3.5-turbo-0613")
 GPT_3_16K_MODELS = ("gpt-3.5-turbo-16k", "gpt-3.5-turbo-16k-0613", "gpt-3.5-turbo-1106", "gpt-3.5-turbo-0125")
 GPT_4_MODELS = ("gpt-4", "gpt-4-0314", "gpt-4-0613", "gpt-4-turbo-preview")
 GPT_4_32K_MODELS = ("gpt-4-32k", "gpt-4-32k-0314", "gpt-4-32k-0613")
+# Vision-модели прошлых поколений
 GPT_4_VISION_MODELS = ("gpt-4o",)
 GPT_4_128K_MODELS = ("gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-turbo", "gpt-4-turbo-2024-04-09")
 GPT_4O_MODELS = ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest")
 O_MODELS = ("o1", "o1-mini", "o1-preview")
-GPT_ALL_MODELS = GPT_3_MODELS + GPT_3_16K_MODELS + GPT_4_MODELS + GPT_4_32K_MODELS + GPT_4_VISION_MODELS + GPT_4_128K_MODELS + GPT_4O_MODELS + O_MODELS
+# GPT-5 (мультимодальные; большой общий контекст)
+GPT_5_MODELS = ("gpt-5",)
+GPT_5_MINI_MODELS = ("gpt-5-mini",)
+GPT_5_NANO_MODELS = ("gpt-5-nano",)
+GPT_5_ALL_MODELS = GPT_5_MODELS + GPT_5_MINI_MODELS + GPT_5_NANO_MODELS
+
+# Полный список
+GPT_ALL_MODELS = (
+    GPT_3_MODELS
+    + GPT_3_16K_MODELS
+    + GPT_4_MODELS
+    + GPT_4_32K_MODELS
+    + GPT_4_VISION_MODELS
+    + GPT_4_128K_MODELS
+    + GPT_4O_MODELS
+    + GPT_5_ALL_MODELS
+    + O_MODELS
+)
+
+# Семейства, требующие ключа `max_completion_tokens` и механизма tools/tool_calls
+REASONING_MODELS = O_MODELS + GPT_5_ALL_MODELS
+
 
 def default_max_tokens(model: str) -> int:
     """
@@ -55,6 +78,8 @@ def default_max_tokens(model: str) -> int:
         return 4096
     elif model in O_MODELS:
         return 4096
+    elif model in GPT_5_ALL_MODELS:
+        return 4096
 
 
 def are_functions_available(model: str) -> bool:
@@ -64,6 +89,9 @@ def are_functions_available(model: str) -> bool:
     if model in ("gpt-3.5-turbo-0301", "gpt-4-0314", "gpt-4-32k-0314", "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613"):
         return False
     if model in O_MODELS:
+        return False
+    if model in GPT_5_ALL_MODELS:
+        # Старое API функций недоступно для reasoning-моделей
         return False
     return True
 
@@ -85,12 +113,11 @@ def localized_text(key, bot_language):
     except KeyError:
         logging.warning(f"No translation available for bot_language code '{bot_language}' and key '{key}'")
         # Fallback to English if the translation is not available
-        if key in translations['en']:
+        if key in translations.get('en', {}):
             return translations['en'][key]
-        else:
-            logging.warning(f"No english definition found for key '{key}' in translations.json")
-            # return key as text
-            return key
+        logging.warning(f"No english definition found for key '{key}' in translations.json")
+        # return key as text
+        return key
 
 
 class OpenAIHelper:
@@ -108,9 +135,9 @@ class OpenAIHelper:
         self.client = openai.AsyncOpenAI(api_key=config['api_key'], http_client=http_client)
         self.config = config
         self.plugin_manager = plugin_manager
-        self.conversations: dict[int: list] = {}  # {chat_id: history}
-        self.conversations_vision: dict[int: bool] = {}  # {chat_id: is_vision}
-        self.last_updated: dict[int: datetime] = {}  # {chat_id: last_update_timestamp}
+        self.conversations: dict[int: list] = {}          # {chat_id: history}
+        self.conversations_vision: dict[int: bool] = {}   # {chat_id: is_vision}
+        self.last_updated: dict[int: datetime] = {}       # {chat_id: last_update_timestamp}
         self.current_telegram_chat_id = 0
         self.current_telegram_user_id = 0
         self.current_telegram_user_name = ""
@@ -126,6 +153,31 @@ class OpenAIHelper:
             self.reset_chat_history(chat_id)
         return len(self.conversations[chat_id]), self.__count_tokens(self.conversations[chat_id])
 
+    def __extract_openai_error_message(self, e: Exception) -> str:
+        """
+        Хелпер для извлечения ошибок и безопасного для телеграмм форматирования
+        """
+        try:
+            body = getattr(e, "response", None)
+            if body is not None:
+                try:
+                    j = body.json()
+                except Exception:
+                    j = None
+                if j and isinstance(j, dict):
+                    # Вернём message; подробности (param/code) используем на вызывающей стороне
+                    return j.get("error", {}).get("message", str(e))
+        except Exception:
+            pass
+        return str(e)
+
+    def __telegram_safe(self, text: str) -> str:
+        # Урезаем спецсимволы MarkdownV2 — чтобы Telegram не падал
+        bad = "*_[]()~`>|#=+-{}.!\\"
+        for ch in bad:
+            text = text.replace(ch, " ")
+        return text
+
     async def get_chat_response(self, chat_id: int, query: str) -> tuple[str, str]:
         """
         Gets a full response from the GPT model.
@@ -135,21 +187,18 @@ class OpenAIHelper:
         """
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query)
-        if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
-            response, plugins_used = await self.__handle_function_call(chat_id, response)
+        if (self.config['enable_functions'] or self.config.get('enable_tools', True)) and not self.conversations_vision[chat_id]:
+            response, plugins_used = await self.__handle_function_or_tool_call(chat_id, response)
             if is_direct_result(response):
                 return response, '0'
 
         answer = ''
-
         if len(response.choices) > 1 and self.config['n_choices'] > 1:
             for index, choice in enumerate(response.choices):
                 content = choice.message.content.strip()
                 if index == 0:
                     self.__add_to_history(chat_id, role="assistant", content=content)
-                answer += f'{index + 1}\u20e3\n'
-                answer += content
-                answer += '\n\n'
+                answer += f'{index + 1}\u20e3\n{content}\n\n'
         else:
             answer = response.choices[0].message.content.strip()
             self.__add_to_history(chat_id, role="assistant", content=answer)
@@ -157,17 +206,20 @@ class OpenAIHelper:
         bot_language = self.config['bot_language']
         show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
         plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
+        safe_total_tokens = self._safe_total_tokens(response, self.__count_tokens(self.conversations[chat_id]))
         if self.config['show_usage']:
-            answer += "\n\n---\n" \
-                      f"💰 {str(response.usage.total_tokens)} {localized_text('stats_tokens', bot_language)}" \
-                      f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
-                      f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+            answer += (
+                "\n\n---\n"
+                f"💰 {str(safe_total_tokens)} {localized_text('stats_tokens', bot_language)}"
+                f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)},"
+                f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+            )
             if show_plugins_used:
                 answer += f"\n🔌 {', '.join(plugin_names)}"
         elif show_plugins_used:
             answer += f"\n\n---\n🔌 {', '.join(plugin_names)}"
 
-        return answer, response.usage.total_tokens
+        return answer, safe_total_tokens
 
     async def get_chat_response_stream(self, chat_id: int, query: str, params: dict):
         """
@@ -182,23 +234,58 @@ class OpenAIHelper:
         self.current_telegram_user_name = params.get('telegram_user_name', None)
         self.usage_tracker = params.get('usage_tracker', {})
         plugins_used = ()
-        response = await self.__common_get_chat_response(chat_id, query, stream=True)
-        if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
-            response, plugins_used = await self.__handle_function_call(chat_id, response, stream=True)
+
+        effective_model = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
+        want_stream = params.get("want_stream", True)
+        if effective_model in REASONING_MODELS:
+            want_stream = False
+
+        try:
+            response = await self.__common_get_chat_response(chat_id, query, stream=want_stream)
+            streaming = want_stream
+        except Exception as e:
+            em = str(e).lower()
+            if ("verified to stream this model" in em) or ("param" in em and "stream" in em and "unsupported_value" in em):
+                response = await self.__common_get_chat_response(chat_id, query, stream=False)
+                streaming = False
+            else:
+                raise
+
+        if (self.config['enable_functions'] or self.config.get('enable_tools', True)) and not self.conversations_vision[chat_id]:
+            response, plugins_used = await self.__handle_function_or_tool_call(chat_id, response, stream=streaming)
             if is_direct_result(response):
                 yield response, '0'
                 return
 
         answer = ''
-        async for chunk in response:
-            if len(chunk.choices) == 0:
-                continue
-            delta = chunk.choices[0].delta
-            if delta.content:
-                answer += delta.content
-                yield answer, 'not_finished'
-        answer = answer.strip()
-        self.__add_to_history(chat_id, role="assistant", content=answer)
+        added_to_history = False
+        if streaming:
+            async for chunk in response:
+                if len(chunk.choices) == 0:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    answer += delta.content
+                    yield answer, 'not_finished'
+            answer = answer.strip()
+            self.__add_to_history(chat_id, role="assistant", content=answer)
+            added_to_history = True
+        else:
+            if len(response.choices) > 1 and self.config['n_choices'] > 1:
+                for index, choice in enumerate(response.choices):
+                    content = choice.message.content.strip()
+                    if index == 0:
+                        self.__add_to_history(chat_id, role="assistant", content=content)
+                        added_to_history = True
+                    answer += f'{index + 1}\u20e3\n{content}\n\n'
+            else:
+                answer = response.choices[0].message.content.strip()
+                self.__add_to_history(chat_id, role="assistant", content=answer)
+                added_to_history = True
+
+        if not added_to_history and answer:
+            self.__add_to_history(chat_id, role="assistant", content=answer)
+
         tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
 
         show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
@@ -251,93 +338,271 @@ class OpenAIHelper:
                     logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
                     self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
 
-            max_tokens_str = 'max_completion_tokens' if self.config['model'] in O_MODELS else 'max_tokens'
+            effective_model = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
+            max_tokens_key = 'max_completion_tokens' if effective_model in REASONING_MODELS else 'max_tokens'
+
             common_args = {
-                'model': self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model'],
+                'model': effective_model,
                 'messages': self.conversations[chat_id],
                 'temperature': self.config['temperature'],
                 'n': self.config['n_choices'],
-                max_tokens_str: self.config['max_tokens'],
+                max_tokens_key: self.config['max_tokens'],
                 'presence_penalty': self.config['presence_penalty'],
                 'frequency_penalty': self.config['frequency_penalty'],
                 'stream': stream
             }
 
-            if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
-                functions = self.plugin_manager.get_functions_specs()
-                if len(functions) > 0:
-                    common_args['functions'] = self.plugin_manager.get_functions_specs()
-                    common_args['function_call'] = 'auto'
+            # Подключаем инструменты:
+            has_specs = False
+            if not self.conversations_vision[chat_id]:
+                function_specs = self.plugin_manager.get_functions_specs()
+                has_specs = len(function_specs) > 0
+                if has_specs:
+                    if effective_model in REASONING_MODELS:
+                        # Новый стиль tools
+                        common_args['tools'] = [
+                            {"type": "function", "function": f} for f in function_specs
+                        ]
+                        common_args['tool_choice'] = 'auto'
+                    else:
+                        # Старый стиль functions
+                        common_args['functions'] = function_specs
+                        common_args['function_call'] = 'auto'
+
             return await self.client.chat.completions.create(**common_args)
 
         except openai.RateLimitError as e:
             raise e
 
         except openai.BadRequestError as e:
-            raise Exception(f"⚠️ _{localized_text('openai_invalid', bot_language)}._ ⚠️\n{str(e)}") from e
+            msg = self.__telegram_safe(self.__extract_openai_error_message(e))
+            raise Exception(f"⚠️ {localized_text('openai_invalid', bot_language)}. ⚠️\n{msg}") from e
 
         except Exception as e:
-            raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
+            msg = self.__telegram_safe(str(e))
+            raise Exception(f"⚠️ {localized_text('error', bot_language)}. ⚠️\n{msg}") from e
 
-    async def __handle_function_call(self, chat_id, response, stream=False, times=0, plugins_used=()):
-        function_name = ''
-        arguments = ''
+    async def __handle_function_or_tool_call(self, chat_id, response, stream=False, times=0, plugins_used=()):
+        """
+        Унифицированная обработка вызовов инструментов:
+        - Новый стиль (GPT-5/О): assistant.tool_calls -> tool-ответы -> догоняющий запрос
+        - Старый стиль (классические модели): function_call -> function (role=function) -> догоняющий запрос
+        """
+        import json
+
+        def _is_reasoning() -> bool:
+            effective_model = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
+            return effective_model in REASONING_MODELS
+
+        def _safe_json_args(raw: str) -> str:
+            """
+            Возвращает строку JSON для передачи в plugin; если raw невалидный JSON, оборачиваем как {"_raw": raw}
+            """
+            try:
+                json.loads(raw if raw else "{}")
+                return raw if raw else "{}"
+            except Exception:
+                return json.dumps({"_raw": raw})
+
+        # Извлекаем tool_calls (новый стиль) и/или function_call (старый стиль) из response ----
+        tool_calls = []
+        function_call = None
+
         if stream:
+            # Стрим: нужно собрать кусочки tool_calls / function_call
             async for item in response:
-                if len(item.choices) > 0:
-                    first_choice = item.choices[0]
-                    if first_choice.delta and first_choice.delta.function_call:
-                        if first_choice.delta.function_call.name:
-                            function_name += first_choice.delta.function_call.name
-                        if first_choice.delta.function_call.arguments:
-                            arguments += first_choice.delta.function_call.arguments
-                    elif first_choice.finish_reason and first_choice.finish_reason == 'function_call':
-                        break
-                    else:
-                        return response, plugins_used
-                else:
-                    return response, plugins_used
-        else:
-            if len(response.choices) > 0:
-                first_choice = response.choices[0]
-                if first_choice.message.function_call:
-                    if first_choice.message.function_call.name:
-                        function_name += first_choice.message.function_call.name
-                    if first_choice.message.function_call.arguments:
-                        arguments += first_choice.message.function_call.arguments
-                else:
-                    return response, plugins_used
-            else:
+                if len(item.choices) == 0:
+                    continue
+                first = item.choices[0]
+
+                # Новый стиль (tool_calls)
+                if getattr(first.delta, "tool_calls", None):
+                    for tc in first.delta.tool_calls:
+                        # гарантируем длину массива
+                        while len(tool_calls) <= tc.index:
+                            tool_calls.append({"id": None, "function": {"name": "", "arguments": ""}})
+                        # накапливаем id и поля функции
+                        if tc.id:
+                            tool_calls[tc.index]["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                tool_calls[tc.index]["function"]["name"] += tc.function.name
+                            if tc.function.arguments:
+                                tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
+
+                # Старый стиль (function_call)
+                if getattr(first.delta, "function_call", None):
+                    if first.delta.function_call.name:
+                        function_call = function_call or {"name": "", "arguments": ""}
+                        function_call["name"] += first.delta.function_call.name
+                    if first.delta.function_call.arguments:
+                        function_call = function_call or {"name": "", "arguments": ""}
+                        function_call["arguments"] += first.delta.function_call.arguments
+
+                # финализация
+                if getattr(first, "finish_reason", None) in ("tool_calls", "function_call", "stop"):
+                    break
+
+            # если вообще никаких вызовов — возвращаем исходный response наверх
+            if (not tool_calls) and (function_call is None):
                 return response, plugins_used
 
-        logging.info(f'Calling function {function_name} with arguments {arguments}')
-        function_response = await self.plugin_manager.call_function(function_name, self, arguments)
+        else:
+            # Non-stream: всё приходит готовым в единственном сообщении
+            if len(response.choices) == 0:
+                return response, plugins_used
+            msg = response.choices[0].message
 
-        if function_name not in plugins_used:
-            plugins_used += (function_name,)
+            # Новый стиль
+            if getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    tool_calls.append({
+                        "id": tc.id,
+                        "function": {
+                            "name": (tc.function.name if tc.function else "") or "",
+                            "arguments": (tc.function.arguments if (tc.function and tc.function.arguments) else "") or ""
+                        }
+                    })
 
-        if is_direct_result(function_response):
-            self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name,
-                                                content=json.dumps({'result': 'Done, the content has been sent'
-                                                                              'to the user.'}))
-            return function_response, plugins_used
+            # Старый стиль
+            if getattr(msg, "function_call", None):
+                function_call = {
+                    "name": msg.function_call.name or "",
+                    "arguments": msg.function_call.arguments or ""
+                }
 
-        self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name, content=function_response)
-        response = await self.client.chat.completions.create(
-            model=self.config['model'],
-            messages=self.conversations[chat_id],
-            functions=self.plugin_manager.get_functions_specs(),
-            function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
-            stream=stream
-        )
-        return await self.__handle_function_call(chat_id, response, stream, times + 1, plugins_used)
+            if (not tool_calls) and (function_call is None):
+                return response, plugins_used
+
+        # Обработка НОВОГО стиля tools/tool_calls
+        if tool_calls:
+            # Зафиксируем сообщение ассистента с tool_calls (это обязательное предшествующее сообщение)
+            normalized_calls = self.__add_assistant_with_tool_calls(chat_id, tool_calls)
+
+            # На каждый tool_call — вызов реального плагина и добавление role=tool с тем же tool_call_id
+            for tc in normalized_calls:
+                fname = tc["function"]["name"]
+                args_raw = tc["function"]["arguments"] or ""
+                args_json_str = _safe_json_args(args_raw)
+
+                logging.info(f'Calling tool {fname} with arguments {args_json_str}')
+                tool_result = await self.plugin_manager.call_function(fname, self, args_json_str)
+
+                if fname not in plugins_used:
+                    plugins_used += (fname,)
+
+                if is_direct_result(tool_result):
+                    # Добавим stub в историю и вернём результат наверх (бот уже отправил ответ пользователю)
+                    self.__add_tool_result_to_history(
+                        chat_id, tool_call_id=tc["id"],
+                        content=json.dumps({'result': 'Done, the content has been sent to the user.'})
+                    )
+                    return tool_result, plugins_used
+
+                # Ответ инструмента
+                self.__add_tool_result_to_history(chat_id, tool_call_id=tc["id"], content=tool_result)
+
+            # Делаем догоняющий запрос: теперь у модели есть tool_calls + ответы tool
+            m = self.config['model']
+            max_key = 'max_completion_tokens' if m in REASONING_MODELS else 'max_tokens'
+            response = await self.client.chat.completions.create(
+                model=m,
+                messages=self.conversations[chat_id],
+                tools=[{"type": "function", "function": f} for f in self.plugin_manager.get_functions_specs()],
+                tool_choice='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
+                **{max_key: self.config['max_tokens']},
+                stream=stream
+            )
+            # Рекурсивно продолжаем обработку до завершения цепочки инструментов
+            return await self.__handle_function_or_tool_call(chat_id, response, stream, times + 1, plugins_used)
+
+        # Обработка СТАРОГО стиля functions/function_call
+        if function_call is not None:
+            fname = function_call["name"]
+            args_json_str = _safe_json_args(function_call["arguments"] or "")
+
+            logging.info(f'Calling function {fname} with arguments {args_json_str}')
+            fn_result = await self.plugin_manager.call_function(fname, self, args_json_str)
+
+            if fname not in plugins_used:
+                plugins_used += (fname,)
+
+            if is_direct_result(fn_result):
+                # совместимость со старым стилем: пишем role=function
+                self.__add_function_call_to_history(
+                    chat_id=chat_id, function_name=fname,
+                    content=json.dumps({'result': 'Done, the content has been sent to the user.'})
+                )
+                return fn_result, plugins_used
+
+            # Записываем ответ функции в историю (старый стиль)
+            self.__add_function_call_to_history(chat_id=chat_id, function_name=fname, content=fn_result)
+
+            # Делаем догоняющий запрос
+            m = self.config['model']
+            max_key = 'max_completion_tokens' if m in REASONING_MODELS else 'max_tokens'
+            response = await self.client.chat.completions.create(
+                model=m,
+                messages=self.conversations[chat_id],
+                functions=self.plugin_manager.get_functions_specs(),
+                function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
+                **{max_key: self.config['max_tokens']},
+                stream=stream
+            )
+            return await self.__handle_function_or_tool_call(chat_id, response, stream, times + 1, plugins_used)
+
+        # Если сюда дошли — ничего вызывать не нужно
+        return response, plugins_used
+
+
+    def __add_assistant_with_tool_calls(self, chat_id: int, tool_calls: list[dict]) -> list[dict]:
+        """
+        Добавляет в историю сообщение ассистента с полем tool_calls (новый API).
+        Возвращает нормализованный список tool_calls (c гарантированными id).
+        """
+        if chat_id not in self.conversations:
+            self.reset_chat_history(chat_id)
+
+        normalized = []
+        for tc in tool_calls:
+            # ожидаем структуру {"id": ..., "function": {"name": ..., "arguments": "..."}}
+            tid = tc.get("id") or f"toolcall_{uuid.uuid4().hex}"
+            fn = tc.get("function", {}) or {}
+            normalized.append({
+                "id": tid,
+                "type": "function",
+                "function": {
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "") or ""
+                }
+            })
+        # важно: само сообщение ассистента ДОЛЖНО содержать tool_calls
+        self.conversations[chat_id].append({
+            "role": "assistant",
+            "content": "",           # обычно пусто
+            "tool_calls": normalized
+        })
+        return normalized
+
+    def __add_tool_result_to_history(self, chat_id: int, tool_call_id: str, content: str):
+        """
+        Сообщение с ролью 'tool' — ответ инструмента на конкретный tool_call.
+        """
+        if chat_id not in self.conversations:
+            self.reset_chat_history(chat_id)
+        self.conversations[chat_id].append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content
+        })
+
+    def __add_function_call_to_history(self, chat_id, function_name, content):
+        """
+        Старый стиль (для совместимости со старыми моделями).
+        """
+        self.conversations[chat_id].append({"role": "function", "name": function_name, "content": content})
 
     async def generate_image(self, prompt: str) -> tuple[str, str]:
-        """
-        Generates an image from the given prompt using DALL·E model.
-        :param prompt: The prompt to send to the model
-        :return: The image URL and the image size
-        """
         bot_language = self.config['bot_language']
         try:
             response = await self.client.images.generate(
@@ -352,13 +617,13 @@ class OpenAIHelper:
             if len(response.data) == 0:
                 logging.error(f'No response from GPT: {str(response)}')
                 raise Exception(
-                    f"⚠️ _{localized_text('error', bot_language)}._ "
+                    f"⚠️ {localized_text('error', bot_language)}. "
                     f"⚠️\n{localized_text('try_again', bot_language)}."
                 )
 
             return response.data[0].url, self.config['image_size']
         except Exception as e:
-            raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
+            raise Exception(f"⚠️ {localized_text('error', bot_language)}. ⚠️\n{self.__telegram_safe(str(e))}") from e
 
     async def generate_speech(self, text: str) -> tuple[any, int]:
         """
@@ -374,13 +639,12 @@ class OpenAIHelper:
                 input=text,
                 response_format='opus'
             )
-
             temp_file = io.BytesIO()
             temp_file.write(response.read())
             temp_file.seek(0)
             return temp_file, len(text)
         except Exception as e:
-            raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
+            raise Exception(f"⚠️ {localized_text('error', bot_language)}. ⚠️\n{self.__telegram_safe(str(e))}") from e
 
     async def transcribe(self, filename):
         """
@@ -393,7 +657,7 @@ class OpenAIHelper:
                 return result.text
         except Exception as e:
             logging.exception(e)
-            raise Exception(f"⚠️ _{localized_text('error', self.config['bot_language'])}._ ⚠️\n{str(e)}") from e
+            raise Exception(f"⚠️ {localized_text('error', self.config['bot_language'])}. ⚠️\n{self.__telegram_safe(str(e))}") from e
 
     @retry(
         reraise=True,
@@ -427,13 +691,12 @@ class OpenAIHelper:
 
             # Summarize the chat history if it's too long to avoid excessive token usage
             token_count = self.__count_tokens(self.conversations[chat_id])
-            exceeded_max_tokens = token_count + self.config['max_tokens'] > self.__max_model_tokens()
+            exceeded_max_tokens = token_count + self.config['vision_max_tokens'] > self.__max_model_tokens()
             exceeded_max_history_size = len(self.conversations[chat_id]) > self.config['max_history_size']
 
             if exceeded_max_tokens or exceeded_max_history_size:
                 logging.info(f'Chat history for chat ID {chat_id} is too long. Summarising...')
                 try:
-                    
                     last = self.conversations[chat_id][-1]
                     summary = await self.__summarise(self.conversations[chat_id][:-1])
                     logging.debug(f'Summary: {summary}')
@@ -444,39 +707,34 @@ class OpenAIHelper:
                     logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
                     self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
 
-            message = {'role':'user', 'content':content}
+            message = {'role': 'user', 'content': content}
 
+            effective_model = self.config['vision_model']
+            max_tokens_key = 'max_completion_tokens' if effective_model in REASONING_MODELS else 'max_tokens'
             common_args = {
-                'model': self.config['vision_model'],
+                'model': effective_model,
                 'messages': self.conversations[chat_id][:-1] + [message],
                 'temperature': self.config['temperature'],
-                'n': 1, # several choices is not implemented yet
-                'max_tokens': self.config['vision_max_tokens'],
+                'n': 1,
+                max_tokens_key: self.config['vision_max_tokens'],
                 'presence_penalty': self.config['presence_penalty'],
                 'frequency_penalty': self.config['frequency_penalty'],
                 'stream': stream
             }
-
-
-            # vision model does not yet support functions
-
-            # if self.config['enable_functions']:
-            #     functions = self.plugin_manager.get_functions_specs()
-            #     if len(functions) > 0:
-            #         common_args['functions'] = self.plugin_manager.get_functions_specs()
-            #         common_args['function_call'] = 'auto'
-            
+            if stream:
+                common_args['stream_options'] = {"include_usage": True}
             return await self.client.chat.completions.create(**common_args)
 
         except openai.RateLimitError as e:
             raise e
 
         except openai.BadRequestError as e:
-            raise Exception(f"⚠️ _{localized_text('openai_invalid', bot_language)}._ ⚠️\n{str(e)}") from e
+            msg = self.__telegram_safe(self.__extract_openai_error_message(e))
+            raise Exception(f"⚠️ {localized_text('openai_invalid', bot_language)}. ⚠️\n{msg}") from e
 
         except Exception as e:
-            raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
-
+            msg = self.__telegram_safe(str(e))
+            raise Exception(f"⚠️ {localized_text('error', bot_language)}. ⚠️\n{msg}") from e
 
     async def interpret_image(self, chat_id, fileobj, prompt=None):
         """
@@ -485,19 +743,10 @@ class OpenAIHelper:
         image = encode_image(fileobj)
         prompt = self.config['vision_prompt'] if prompt is None else prompt
 
-        content = [{'type':'text', 'text':prompt}, {'type':'image_url', \
-                    'image_url': {'url':image, 'detail':self.config['vision_detail'] } }]
+        content = [{'type': 'text', 'text': prompt}, {'type': 'image_url',
+                    'image_url': {'url': image, 'detail': self.config['vision_detail']}}]
 
         response = await self.__common_get_chat_response_vision(chat_id, content)
-
-        
-
-        # functions are not available for this model
-        
-        # if self.config['enable_functions']:
-        #     response, plugins_used = await self.__handle_function_call(chat_id, response)
-        #     if is_direct_result(response):
-        #         return response, '0'
 
         answer = ''
 
@@ -514,20 +763,27 @@ class OpenAIHelper:
             self.__add_to_history(chat_id, role="assistant", content=answer)
 
         bot_language = self.config['bot_language']
-        # Plugins are not enabled either
-        # show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
-        # plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
+
+        tokens_used = None
+        try:
+            if getattr(response, "usage", None) is not None:
+                tokens_used = self._safe_total_tokens(response, self.__count_tokens(self.conversations[chat_id]))
+        except Exception:
+            tokens_used = None
+        if tokens_used is None:
+            tokens_used = self.__count_tokens(self.conversations[chat_id])
+
         if self.config['show_usage']:
             answer += "\n\n---\n" \
-                      f"💰 {str(response.usage.total_tokens)} {localized_text('stats_tokens', bot_language)}" \
-                      f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
-                      f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
-            # if show_plugins_used:
-            #     answer += f"\n🔌 {', '.join(plugin_names)}"
-        # elif show_plugins_used:
-        #     answer += f"\n\n---\n🔌 {', '.join(plugin_names)}"
+                      f"💰 {str(tokens_used)} {localized_text('stats_tokens', bot_language)}"
+            try:
+                if getattr(response, "usage", None) is not None:
+                    answer += f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
+                              f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+            except Exception:
+                pass
 
-        return answer, response.usage.total_tokens
+        return answer, str(tokens_used)
 
     async def interpret_image_stream(self, chat_id, fileobj, prompt=None):
         """
@@ -536,41 +792,52 @@ class OpenAIHelper:
         image = encode_image(fileobj)
         prompt = self.config['vision_prompt'] if prompt is None else prompt
 
-        content = [{'type':'text', 'text':prompt}, {'type':'image_url', \
-                    'image_url': {'url':image, 'detail':self.config['vision_detail'] } }]
+        content = [{'type': 'text', 'text': prompt}, {'type': 'image_url',
+                    'image_url': {'url': image, 'detail': self.config['vision_detail']}}]
 
-        response = await self.__common_get_chat_response_vision(chat_id, content, stream=True)
+        want_stream = self.config.get("vision_want_stream", True)
+        if self.config['vision_model'] in REASONING_MODELS:
+            want_stream = False
 
-        
-
-        # if self.config['enable_functions']:
-        #     response, plugins_used = await self.__handle_function_call(chat_id, response, stream=True)
-        #     if is_direct_result(response):
-        #         yield response, '0'
-        #         return
+        try:
+            response = await self.__common_get_chat_response_vision(chat_id, content, stream=want_stream)
+        except Exception as e:
+            em = str(e).lower()
+            if ("verified to stream this model" in em) or ("param" in em and "stream" in em and "unsupported_value" in em):
+                response = await self.__common_get_chat_response_vision(chat_id, content, stream=False)
+                want_stream = False
+            else:
+                raise
 
         answer = ''
-        async for chunk in response:
-            if len(chunk.choices) == 0:
-                continue
-            delta = chunk.choices[0].delta
-            if delta.content:
-                answer += delta.content
-                yield answer, 'not_finished'
-        answer = answer.strip()
-        self.__add_to_history(chat_id, role="assistant", content=answer)
-        tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
-
-        #show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
-        #plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
-        if self.config['show_usage']:
-            answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
-        #     if show_plugins_used:
-        #         answer += f"\n🔌 {', '.join(plugin_names)}"
-        # elif show_plugins_used:
-        #     answer += f"\n\n---\n🔌 {', '.join(plugin_names)}"
-
-        yield answer, tokens_used
+        if want_stream:
+            async for chunk in response:
+                if len(chunk.choices) == 0:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    answer += delta.content
+                    yield answer, 'not_finished'
+            answer = answer.strip()
+            self.__add_to_history(chat_id, role="assistant", content=answer)
+            tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+            if self.config['show_usage']:
+                answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+            yield answer, tokens_used
+        else:
+            if len(response.choices) > 1 and self.config['n_choices'] > 1:
+                for index, choice in enumerate(response.choices):
+                    content = choice.message.content.strip()
+                    if index == 0:
+                        self.__add_to_history(chat_id, role="assistant", content=content)
+                    answer += f'{index + 1}\u20e3\n{content}\n\n'
+            else:
+                answer = response.choices[0].message.content.strip()
+                self.__add_to_history(chat_id, role="assistant", content=answer)
+            tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+            if self.config['show_usage']:
+                answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+            yield answer, tokens_used
 
     def reset_chat_history(self, chat_id, content=''):
         """
@@ -594,19 +861,16 @@ class OpenAIHelper:
         max_age_minutes = self.config['max_conversation_age_minutes']
         return last_updated < now - datetime.timedelta(minutes=max_age_minutes)
 
-    def __add_function_call_to_history(self, chat_id, function_name, content):
-        """
-        Adds a function call to the conversation history
-        """
-        self.conversations[chat_id].append({"role": "function", "name": function_name, "content": content})
-
     def __add_to_history(self, chat_id, role, content):
         """
         Adds a message to the conversation history.
         :param chat_id: The chat ID
-        :param role: The role of the message sender
-        :param content: The message content
+        :param role: 'system' | 'user' | 'assistant' | 'tool' | 'function'
+        :param content: str | list (для vision-сообщений)
         """
+        # на случай, если история ещё не инициализирована
+        if chat_id not in self.conversations:
+            self.reset_chat_history(chat_id)
         self.conversations[chat_id].append({"role": role, "content": content})
 
     async def __summarise(self, conversation) -> str:
@@ -642,6 +906,8 @@ class OpenAIHelper:
             return base * 31
         if self.config['model'] in GPT_4O_MODELS:
             return base * 31
+        if self.config['model'] in GPT_5_ALL_MODELS:
+            return 128_000
         elif self.config['model'] in O_MODELS:
             # https://platform.openai.com/docs/models#o1
             if self.config['model'] == "o1":
@@ -664,8 +930,18 @@ class OpenAIHelper:
         model = self.config['model']
         try:
             encoding = tiktoken.encoding_for_model(model)
-        except KeyError: # было gpt-3.5-turbo фикс на cl100k_base или p50k_base https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
-            encoding = tiktoken.get_encoding("cl100k_base")
+        except KeyError:
+            # GPT-5 использует семейство o200k; пробуем Harmony → Base, затем cl100k
+            try:
+                if model in GPT_5_ALL_MODELS:
+                    try:
+                        encoding = tiktoken.get_encoding("o200k_harmony")
+                    except Exception:
+                        encoding = tiktoken.get_encoding("o200k_base")
+                else:
+                    encoding = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                encoding = tiktoken.get_encoding("cl100k_base")
 
         if model in GPT_ALL_MODELS:
             tokens_per_message = 3
@@ -687,13 +963,14 @@ class OpenAIHelper:
                             else:
                                 num_tokens += len(encoding.encode(message1['text']))
                 else:
-                    num_tokens += len(encoding.encode(value))
+                    if isinstance(value, str):
+                        num_tokens += len(encoding.encode(value))
+                    else:
+                        num_tokens += len(encoding.encode(str(value)))
                     if key == "name":
                         num_tokens += tokens_per_name
         num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
         return num_tokens
-
-    # no longer needed
 
     def __count_tokens_vision(self, image_bytes: bytes) -> int:
         """
@@ -704,17 +981,17 @@ class OpenAIHelper:
         image_file = io.BytesIO(image_bytes)
         image = Image.open(image_file)
         model = self.config['vision_model']
-        if model not in GPT_4_VISION_MODELS:
+        if model not in (GPT_4_VISION_MODELS + GPT_5_ALL_MODELS):
             raise NotImplementedError(f"""count_tokens_vision() is not implemented for model {model}.""")
-        
+
         w, h = image.size
-        if w > h: w, h = h, w
-        # this computation follows https://platform.openai.com/docs/guides/vision and https://openai.com/pricing#gpt-4-turbo
+        if w > h:
+            w, h = h, w
         base_tokens = 85
         detail = self.config['vision_detail']
         if detail == 'low':
             return base_tokens
-        elif detail == 'high' or detail == 'auto': # assuming worst cost for auto
+        elif detail in ('high', 'auto'): # assuming worst cost for auto
             f = max(w / 768, h / 2048)
             if f > 1:
                 w, h = int(w / f), int(h / f)
@@ -724,29 +1001,6 @@ class OpenAIHelper:
             return num_tokens
         else:
             raise NotImplementedError(f"""unknown parameter detail={detail} for model {model}.""")
-
-    # No longer works as of July 21st 2023, as OpenAI has removed the billing API
-    # def get_billing_current_month(self):
-    #     """Gets billed usage for current month from OpenAI API.
-    #
-    #     :return: dollar amount of usage this month
-    #     """
-    #     headers = {
-    #         "Authorization": f"Bearer {openai.api_key}"
-    #     }
-    #     # calculate first and last day of current month
-    #     today = date.today()
-    #     first_day = date(today.year, today.month, 1)
-    #     _, last_day_of_month = monthrange(today.year, today.month)
-    #     last_day = date(today.year, today.month, last_day_of_month)
-    #     params = {
-    #         "start_date": first_day,
-    #         "end_date": last_day
-    #     }
-    #     response = requests.get("https://api.openai.com/dashboard/billing/usage", headers=headers, params=params)
-    #     billing_data = json.loads(response.text)
-    #     usage_month = billing_data["total_usage"] / 100  # convert cent amount to dollars
-    #     return usage_month
 
     def get_current_telegram_chat_user_info(self) -> int:
         """
@@ -758,3 +1012,15 @@ class OpenAIHelper:
             "user_name": self.current_telegram_user_name,
             "usage_tracker": self.usage_tracker
         }
+    
+    def _safe_total_tokens(self, resp, fallback: int) -> int:
+        """
+        Безопасно извлекаем usage tokens
+        """
+        try:
+            u = getattr(resp, "usage", None)
+            if u is not None and getattr(u, "total_tokens", None) is not None:
+                return int(u.total_tokens)
+        except Exception:
+            pass
+        return int(fallback)
