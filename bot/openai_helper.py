@@ -235,7 +235,11 @@ class OpenAIHelper:
         self.usage_tracker = params.get('usage_tracker', {})
         plugins_used = ()
 
-        effective_model = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
+        # сброс истории при отсуствии chat_id
+        if chat_id not in self.conversations or chat_id not in self.conversations_vision or self.__max_age_reached(chat_id):
+            self.reset_chat_history(chat_id)
+
+        effective_model = self.config['model'] if not self.conversations_vision.get(chat_id, False) else self.config['vision_model']
         want_stream = params.get("want_stream", True)
         if effective_model in REASONING_MODELS:
             want_stream = False
