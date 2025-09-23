@@ -463,6 +463,7 @@ class ChatGPTTelegramBot:
 
         chat_id = update.effective_chat.id
         prompt = update.message.caption
+        total_tokens = 0
 
         if is_group_chat(update):
             if self.config['ignore_group_vision']:
@@ -639,11 +640,11 @@ class ChatGPTTelegramBot:
                         parse_mode=constants.ParseMode.MARKDOWN
                     )
             vision_token_price = self.config['vision_token_price']
-            self.usage[user_id].add_vision_tokens(total_tokens, vision_token_price)
+            self.usage[user_id].add_vision_tokens(int(total_tokens), vision_token_price)
 
             allowed_user_ids = self.config['allowed_user_ids'].split(',')
             if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                self.usage["guests"].add_vision_tokens(total_tokens, vision_token_price)
+                self.usage["guests"].add_vision_tokens(int(total_tokens), vision_token_price)
 
         await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
 
