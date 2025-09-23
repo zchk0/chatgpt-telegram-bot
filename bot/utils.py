@@ -132,10 +132,9 @@ async def edit_message_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 inline_message_id=message_id if is_inline else None,
                 text=text,
             )
-        except Exception as e:
-            logging.warning(f'Failed to edit message: {str(e)}')
-            raise e
-
+        except Exception as e2:
+            logging.warning(f'Failed to edit message: {str(e2)}')
+            raise e2
     except Exception as e:
         logging.warning(str(e))
         raise e
@@ -382,9 +381,33 @@ def cleanup_intermediate_files(response: any):
 
 # Function to encode the image
 def encode_image(fileobj):
-    image = base64.b64encode(fileobj.getvalue()).decode('utf-8')
-    return f'data:image/jpeg;base64,{image}'
+    """
+    Encodes a bytes-like image file to a data URL with detected MIME.
+    """
+    data = fileobj.getvalue()
+    head = data[:8]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif head[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    else:
+        mime = "application/octet-stream"
+    image_b64 = base64.b64encode(data).decode('utf-8')
+    return f'data:{mime};base64,{image_b64}'
 
-def decode_image(imgbase64):
-    image = imgbase64[len('data:image/jpeg;base64,'):]
-    return base64.b64decode(image)
+
+def decode_image(imgbase64: str) -> bytes:
+    """
+    Decodes a data URL (or raw base64) to bytes.
+    Supports strings like 'data:image/png;base64,<...>' and plain base64 strings.
+    """
+    if not imgbase64:
+        return b""
+    idx = imgbase64.find('base64,')
+    if idx != -1:
+        imgbase64 = imgbase64[idx + 7:]
+    try:
+        return base64.b64decode(imgbase64)
+    except Exception:
+        # best-effort: return empty bytes on bad input
+        return b""

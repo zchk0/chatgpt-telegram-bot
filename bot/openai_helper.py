@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import datetime
 import logging
 import os
@@ -186,8 +187,12 @@ class OpenAIHelper:
         :return: The answer from the model and the number of tokens used
         """
         plugins_used = ()
+
+        # Авто-выход из vision при первом текстовом запросе
+        await self.__auto_exit_vision_if_needed(chat_id)
+
         response = await self.__common_get_chat_response(chat_id, query)
-        if (self.config['enable_functions'] or self.config.get('enable_tools', True)) and not self.conversations_vision[chat_id]:
+        if (self.config['enable_functions'] or self.config.get('enable_tools', True)):
             response, plugins_used = await self.__handle_function_or_tool_call(chat_id, response)
             if is_direct_result(response):
                 return response, '0'
@@ -238,6 +243,9 @@ class OpenAIHelper:
         # сброс истории при отсуствии chat_id
         if chat_id not in self.conversations or chat_id not in self.conversations_vision or self.__max_age_reached(chat_id):
             self.reset_chat_history(chat_id)
+        
+        # Авто-выход из vision при первом текстовом запросе
+        await self.__auto_exit_vision_if_needed(chat_id)
 
         effective_model = self.config['model'] if not self.conversations_vision.get(chat_id, False) else self.config['vision_model']
         want_stream = params.get("want_stream", True)
@@ -255,7 +263,7 @@ class OpenAIHelper:
             else:
                 raise
 
-        if (self.config['enable_functions'] or self.config.get('enable_tools', True)) and not self.conversations_vision[chat_id]:
+        if (self.config['enable_functions'] or self.config.get('enable_tools', True)):
             response, plugins_used = await self.__handle_function_or_tool_call(chat_id, response, stream=streaming)
             if is_direct_result(response):
                 yield response, '0'
@@ -357,21 +365,15 @@ class OpenAIHelper:
             }
 
             # Подключаем инструменты:
-            has_specs = False
-            if not self.conversations_vision[chat_id]:
-                function_specs = self.plugin_manager.get_functions_specs()
-                has_specs = len(function_specs) > 0
-                if has_specs:
-                    if effective_model in REASONING_MODELS:
-                        # Новый стиль tools
-                        common_args['tools'] = [
-                            {"type": "function", "function": f} for f in function_specs
-                        ]
-                        common_args['tool_choice'] = 'auto'
-                    else:
-                        # Старый стиль functions
-                        common_args['functions'] = function_specs
-                        common_args['function_call'] = 'auto'
+            function_specs = self.plugin_manager.get_functions_specs()
+            has_specs = len(function_specs) > 0
+            if has_specs:
+                if effective_model in REASONING_MODELS:
+                    common_args['tools'] = [{"type": "function", "function": f} for f in function_specs]
+                    common_args['tool_choice'] = 'auto'
+                else:
+                    common_args['functions'] = function_specs
+                    common_args['function_call'] = 'auto'
 
             return await self.client.chat.completions.create(**common_args)
 
@@ -507,7 +509,7 @@ class OpenAIHelper:
                 self.__add_tool_result_to_history(chat_id, tool_call_id=tc["id"], content=tool_result)
 
             # Делаем догоняющий запрос: теперь у модели есть tool_calls + ответы tool
-            m = self.config['model']
+            m = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
             max_key = 'max_completion_tokens' if m in REASONING_MODELS else 'max_tokens'
             response = await self.client.chat.completions.create(
                 model=m,
@@ -543,7 +545,7 @@ class OpenAIHelper:
             self.__add_function_call_to_history(chat_id=chat_id, function_name=fname, content=fn_result)
 
             # Делаем догоняющий запрос
-            m = self.config['model']
+            m = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
             max_key = 'max_completion_tokens' if m in REASONING_MODELS else 'max_tokens'
             response = await self.client.chat.completions.create(
                 model=m,
@@ -683,13 +685,16 @@ class OpenAIHelper:
 
             self.last_updated[chat_id] = datetime.datetime.now()
 
-            if self.config['enable_vision_follow_up_questions']:
+            # сохраняем в историю «для нас»
+            if self.config.get('enable_vision_follow_up_questions', False):
                 self.conversations_vision[chat_id] = True
                 self.__add_to_history(chat_id, role="user", content=content)
             else:
+                # чтобы не раздувать историю, кладём только текст
+                query = ""
                 for message in content:
-                    if message['type'] == 'text':
-                        query = message['text']
+                    if message.get("type") in ("text", "input_text"):
+                        query = message.get("text", "")
                         break
                 self.__add_to_history(chat_id, role="user", content=query)
 
@@ -699,7 +704,7 @@ class OpenAIHelper:
             exceeded_max_history_size = len(self.conversations[chat_id]) > self.config['max_history_size']
 
             if exceeded_max_tokens or exceeded_max_history_size:
-                logging.info(f'Chat history for chat ID {chat_id} is too long. Summarising...')
+                logging.info(f'[VISION] Chat history for chat ID {chat_id} is too long. Summarising...')
                 try:
                     last = self.conversations[chat_id][-1]
                     summary = await self.__summarise(self.conversations[chat_id][:-1])
@@ -708,7 +713,7 @@ class OpenAIHelper:
                     self.__add_to_history(chat_id, role="assistant", content=summary)
                     self.conversations[chat_id] += [last]
                 except Exception as e:
-                    logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
+                    logging.warning(f'[VISION] Error while summarising chat history: {str(e)}. Popping elements instead...')
                     self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
 
             message = {'role': 'user', 'content': content}
@@ -727,7 +732,22 @@ class OpenAIHelper:
             }
             if stream:
                 common_args['stream_options'] = {"include_usage": True}
-            return await self.client.chat.completions.create(**common_args)
+
+            # логируем что отправляем для распознавания
+            log_args = copy.deepcopy(common_args)
+            for m in log_args.get("messages", []):
+                if isinstance(m.get("content"), list):
+                    for c in m["content"]:
+                        if c.get("type") == "image_url":
+                            url = c["image_url"].get("url", "")
+                            if len(url) > 50:
+                                c["image_url"]["url"] = url[:50] + "..."
+            logging.info(f"[VISION] Sending request: {log_args}")
+
+            # логируем что получаем после распознавания
+            resp = await self.client.chat.completions.create(**common_args)
+            logging.info(f"[VISION] Received response: {resp}")
+            return resp
 
         except openai.RateLimitError as e:
             raise e
@@ -740,54 +760,162 @@ class OpenAIHelper:
             msg = self.__telegram_safe(str(e))
             raise Exception(f"⚠️ {localized_text('error', bot_language)}. ⚠️\n{msg}") from e
 
+
     async def interpret_image(self, chat_id, fileobj, prompt=None):
         """
         Interprets a given PNG image file using the Vision model.
         """
-        image = encode_image(fileobj)
-        prompt = self.config['vision_prompt'] if prompt is None else prompt
+        def _to_data_url(b64: str, mime: str = "image/png") -> str:
+            # encode_image(fileobj) может вернуть «голый» base64 — превратим в data URL
+            if not b64:
+                return ""
+            if b64.startswith("data:"):
+                return b64
+            return f"data:{mime};base64,{b64}"
 
-        content = [{'type': 'text', 'text': prompt}, {'type': 'image_url',
-                    'image_url': {'url': image, 'detail': self.config['vision_detail']}}]
+        def _extract_text_from_choice(choice) -> str:
+            """
+            Универсальный экстрактор текста:
+            - message.output_text
+            - message.content: str | list[parts{type: text|output_text|refusal|reasoning, text/...}]
+            - message.refusal / message.reasoning (строки)
+            """
+            msg = getattr(choice, "message", None)
+            if msg is None:
+                return ""
 
-        response = await self.__common_get_chat_response_vision(chat_id, content)
-
-        answer = ''
-
-        if len(response.choices) > 1 and self.config['n_choices'] > 1:
-            for index, choice in enumerate(response.choices):
-                content = choice.message.content.strip()
-                if index == 0:
-                    self.__add_to_history(chat_id, role="assistant", content=content)
-                answer += f'{index + 1}\u20e3\n'
-                answer += content
-                answer += '\n\n'
-        else:
-            answer = response.choices[0].message.content.strip()
-            self.__add_to_history(chat_id, role="assistant", content=answer)
-
-        bot_language = self.config['bot_language']
-
-        tokens_used = None
-        try:
-            if getattr(response, "usage", None) is not None:
-                tokens_used = self._safe_total_tokens(response, self.__count_tokens(self.conversations[chat_id]))
-        except Exception:
-            tokens_used = None
-        if tokens_used is None:
-            tokens_used = self.__count_tokens(self.conversations[chat_id])
-
-        if self.config['show_usage']:
-            answer += "\n\n---\n" \
-                      f"💰 {str(tokens_used)} {localized_text('stats_tokens', bot_language)}"
             try:
-                if getattr(response, "usage", None) is not None:
-                    answer += f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
-                              f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+                ot = getattr(msg, "output_text", None)
+                if ot:
+                    t = (ot or "").strip()
+                    if t:
+                        return t
             except Exception:
                 pass
 
-        return answer, str(tokens_used)
+            c = getattr(msg, "content", "")
+            if isinstance(c, str):
+                t = c.strip()
+                if t:
+                    return t
+
+            parts_text = []
+
+            if isinstance(c, list):
+                for p in c:
+                    # dict-части
+                    if isinstance(p, dict):
+                        typ = p.get("type")
+                        # допустимые типы, в которых может лежать человекочитаемый текст
+                        if typ in {"text", "output_text", "refusal", "reasoning"}:
+                            # разные модели кладут текст в разных ключах
+                            t = p.get("text") or p.get("output_text") or p.get("refusal") or p.get("reasoning") or ""
+                            if t:
+                                parts_text.append(t)
+                    else:
+                        # объектные части
+                        try:
+                            typ = getattr(p, "type", "")
+                            if typ in ("text", "output_text", "refusal", "reasoning"):
+                                t = (
+                                    getattr(p, "text", "")
+                                    or getattr(p, "output_text", "")
+                                    or getattr(p, "refusal", "")
+                                    or getattr(p, "reasoning", "")
+                                    or ""
+                                )
+                                if t:
+                                    parts_text.append(t)
+                        except Exception:
+                            pass
+
+            if parts_text:
+                return "".join(parts_text).strip()
+
+            # Иногда SDK кладёт отказ/рассуждения в отдельные поля
+            try:
+                ref = getattr(msg, "refusal", None)
+                if ref and isinstance(ref, str) and ref.strip():
+                    return ref.strip()
+            except Exception:
+                pass
+
+            try:
+                rsn = getattr(msg, "reasoning", None)
+                if rsn and isinstance(rsn, str) and rsn.strip():
+                    return rsn.strip()
+            except Exception:
+                pass
+
+            # Если пришли tool_calls — текста может не быть
+            if getattr(msg, "tool_calls", None):
+                logging.info("[VISION] tool_calls present; content empty")
+                return ""
+
+            return (str(c) if c is not None else "").strip()
+
+        async def _ask_with_content(content_parts):
+            resp = await self.__common_get_chat_response_vision(chat_id, content_parts, stream=False)
+            choices = getattr(resp, "choices", []) or []
+            ans = ""
+            if choices:
+                text = _extract_text_from_choice(choices[0])
+                ans = (text or "").strip()
+                if ans:
+                    self.__add_to_history(chat_id, role="assistant", content=ans)
+
+            # токены
+            tokens_used = None
+            try:
+                if getattr(resp, "usage", None) is not None:
+                    tokens_used = self._safe_total_tokens(resp, self.__count_tokens(self.conversations[chat_id]))
+            except Exception:
+                tokens_used = None
+            if tokens_used is None:
+                tokens_used = self.__count_tokens(self.conversations[chat_id])
+
+            # полезные логи
+            try:
+                fr = getattr(choices[0], "finish_reason", None) if choices else None
+                ct = type(getattr(choices[0].message, "content", None)).__name__ if choices and getattr(choices[0], "message", None) else None
+                logging.info(f"[VISION] finish_reason={fr}, content_type={ct}, extracted_len={len(ans)}")
+            except Exception:
+                pass
+
+            return ans, str(tokens_used), resp
+
+        # подготовка контента
+        b64 = encode_image(fileobj)
+        data_url = _to_data_url(b64, mime="image/png")
+        prompt_text = self.config['vision_prompt'] if prompt is None else prompt
+
+        content = [
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": data_url, "detail": self.config.get("vision_detail", "auto")}},
+        ]
+        answer, tokens_used, resp = await _ask_with_content(content)
+
+        if not answer:
+            answer = "Извините, модель вернула пустой ответ. Попробуйте ещё раз или пришлите фото крупнее/светлее. Если проблема повторится увеличьте vision_max_tokens"
+
+        # show_usage
+        if self.config.get("show_usage"):
+            bot_language = self.config["bot_language"]
+            answer += (
+                "\n\n---\n"
+                f"💰 {tokens_used} {localized_text('stats_tokens', bot_language)}"
+            )
+            try:
+                if getattr(resp, "usage", None) is not None:
+                    answer += (
+                        f" ({str(resp.usage.prompt_tokens)} {localized_text('prompt', bot_language)}, "
+                        f"{str(resp.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+                    )
+            except Exception:
+                pass
+
+        return answer, tokens_used
+
 
     async def interpret_image_stream(self, chat_id, fileobj, prompt=None):
         """
@@ -877,22 +1005,30 @@ class OpenAIHelper:
             self.reset_chat_history(chat_id)
         self.conversations[chat_id].append({"role": role, "content": content})
 
-    async def __summarise(self, conversation) -> str:
+    async def __summarise(self, conversation, max_tokens: int = 256) -> str:
         """
         Summarises the conversation history.
-        :param conversation: The conversation history
-        :return: The summary
+        :param conversation: list[dict] | any — часть истории
+        :param max_tokens: лимит токенов для сводки
         """
-        messages = [
-            {"role": "assistant", "content": "Summarize this conversation in 700 characters or less"},
-            {"role": "user", "content": str(conversation)}
-        ]
-        response = await self.client.chat.completions.create(
-            model=self.config['model'],
-            messages=messages,
-            temperature=1 if self.config['model'] in O_MODELS else 0.4
+        import json as _json
+        prompt = (
+            "Summarize the prior exchange (possibly about an image) in a compact way. "
+            "Keep user intent and key facts; drop chit-chat. "
+            f"Target <= {max_tokens} tokens."
         )
-        return response.choices[0].message.content
+        messages = [
+            {"role": "assistant", "content": prompt},
+            {"role": "user", "content": _json.dumps(conversation, ensure_ascii=False)}
+        ]
+        m = self.config['model']
+        max_key = 'max_completion_tokens' if m in REASONING_MODELS else 'max_tokens'
+        response = await self.client.chat.completions.create(
+            model=m,
+            messages=messages,
+            **{max_key: max(64, int(max_tokens))}
+        )
+        return (response.choices[0].message.content or "").strip()
 
     def __max_model_tokens(self):
         base = 4096
@@ -1028,3 +1164,120 @@ class OpenAIHelper:
         except Exception:
             pass
         return int(fallback)
+
+
+    def _extract_text_from_choice(self, choice) -> str:
+        """
+        Универсально достаёт текст из ответа (Chat Completions/мультимодаль).
+        Покрывает варианты: content=str, content=list[parts], output_text, tool_calls.
+        """
+        # Иногда SDK кладёт итог в message.output_text
+        try:
+            ot = getattr(choice.message, "output_text", None)
+            if ot:
+                return (ot or "").strip()
+        except Exception:
+            pass
+
+        # Стандартное поле
+        msg = getattr(choice, "message", None)
+        if msg is None:
+            return ""
+
+        content = getattr(msg, "content", "")
+        # content=string
+        if isinstance(content, str):
+            t = content.strip()
+            if t:
+                return t
+
+        # content=list частей (мультимодаль/«reasoning»)
+        parts_text = []
+        if isinstance(content, list):
+            for p in content:
+                # dict-части нового формата
+                if isinstance(p, dict):
+                    t = p.get("text") or p.get("output_text") or ""
+                    if p.get("type") in {"text", "output_text"} and t:
+                        parts_text.append(t)
+                else:
+                    # объект с атрибутами
+                    try:
+                        typ = getattr(p, "type", "")
+                        if typ in ("text", "output_text"):
+                            t = getattr(p, "text", "") or getattr(p, "output_text", "") or ""
+                            if t:
+                                parts_text.append(t)
+                    except Exception:
+                        pass
+            if parts_text:
+                return "".join(parts_text).strip()
+
+        # Если контент пуст, посмотрим tool-calls (часто тогда content="")
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            # Лог для диагностики и простой текст на всякий случай
+            try:
+                logging.info("[VISION] tool_calls present: %s", repr(tool_calls)[:400])
+            except Exception:
+                pass
+            # Если не выполняете инструменты, лучше не пытаться «склеивать» их аргументы в ответ.
+            # Вернём пусто — пусть сработает ваш fallback.
+            return ""
+
+        # fallback
+        return (str(content) if content is not None else "").strip()
+
+
+    async def __auto_exit_vision_if_needed(self, chat_id: int):
+        """
+        Если включён exit_vision_on_text и чат сейчас в vision-режиме,
+        сворачиваем историю с изображением в короткую сводку и выходим из vision.
+        Конфиг берём из self.config: строки 'true'/'false', числа — как строки.
+        """
+        exit_on_text = self.config.get('exit_vision_on_text', False)
+        keep_last_n = int(self.config.get('vision_exit_keep_last_n', '0'))
+        sum_tokens  = int(self.config.get('vision_exit_summary_tokens', '256'))
+
+        logging.info(f"Text after a photo vision. exit_on_text={exit_on_text}, "
+             f"is_vision={self.conversations_vision.get(chat_id)}, "
+             f"keep_last_n={keep_last_n}, summary_tokens={sum_tokens}")
+        
+        if not exit_on_text:
+            return
+        if not self.conversations_vision.get(chat_id, False):
+            return
+        if chat_id not in self.conversations or not self.conversations[chat_id]:
+            return
+
+        history = self.conversations[chat_id]
+        head = history[0]                  # system / первый элемент
+        body = history[1:]                 # остальная история (в т.ч. image-сообщения)
+
+        # Делаем сводку body с лимитом токенов
+        try:
+            summary = await self.__summarise(body, max_tokens=sum_tokens)
+        except Exception:
+            summary = "Не удалось сгенерировать сводку предыдущего обсуждения изображения."
+
+        # Берём «сырой» хвост, если нужно (напр., последний ответ ассистента)
+        if keep_last_n > 0:
+            raw_tail = body[-keep_last_n:]
+            tail = []
+            for m in raw_tail:
+                c = m.get("content")
+                if isinstance(c, str) and c.strip():
+                    tail.append(m)
+                # всё, что не строка (списки/картинки/файлы/tool и т.п.) — отбрасываем
+        else:
+            tail = []
+
+        # Пересобираем историю: system + краткая сводка + опционный хвост
+        new_history = [
+            head,
+            {"role": "assistant", "content": f"Краткая сводка обсуждения изображения: {summary}"}
+        ]
+        new_history.extend(tail)
+        self.conversations[chat_id] = new_history
+        # Выходим из vision-режима
+        self.conversations_vision[chat_id] = False

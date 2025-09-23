@@ -54,12 +54,16 @@ def main():
         'show_plugins_used': os.environ.get('SHOW_PLUGINS_USED', 'false').lower() == 'true',
         'whisper_prompt': os.environ.get('WHISPER_PROMPT', ''),
         'vision_model': os.environ.get('VISION_MODEL', 'gpt-4o'),
-        'enable_vision_follow_up_questions': os.environ.get('ENABLE_VISION_FOLLOW_UP_QUESTIONS', 'true').lower() == 'true',
         'vision_prompt': os.environ.get('VISION_PROMPT', 'What is in this image'),
         'vision_detail': os.environ.get('VISION_DETAIL', 'auto'),
-        'vision_max_tokens': int(os.environ.get('VISION_MAX_TOKENS', '300')),
+        'vision_max_tokens': int(os.environ.get('VISION_MAX_TOKENS', '1024')),
         'tts_model': os.environ.get('TTS_MODEL', 'tts-1'),
         'tts_voice': os.environ.get('TTS_VOICE', 'alloy'),
+        # ниже методы выхода из vision режима при дальнейших текстовых запросах
+        'enable_vision_follow_up_questions': os.environ.get('ENABLE_VISION_FOLLOW_UP_QUESTIONS', 'true').lower() == 'true',
+        'exit_vision_on_text': os.environ.get('EXIT_VISION_ON_TEXT', 'false').lower() == 'true',
+        'vision_exit_keep_last_n': os.environ.get('VISION_EXIT_KEEP_LAST_N', 0),
+        'vision_exit_summary_tokens': os.environ.get('VISION_EXIT_SUMMARY_TOKENS', 300),
     }
 
     if openai_config['enable_functions'] and not functions_available:
