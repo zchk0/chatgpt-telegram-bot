@@ -85,21 +85,45 @@ def split_into_chunks(text: str, chunk_size: int = 4096) -> list[str]:
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
-async def wrap_with_indicator(update: Update, context: CallbackContext, coroutine,
-                              chat_action: constants.ChatAction = "", is_inline=False):
+async def wrap_with_indicator(update: Update,
+    context: CallbackContext,
+    coroutine,
+    chat_action: constants.ChatAction = constants.ChatAction.TYPING,
+    is_inline = False,
+    interval: float = 4.5,
+):
     """
     Wraps a coroutine while repeatedly sending a chat action to the user.
     """
     task = context.application.create_task(coroutine(), update=update)
-    while not task.done():
-        if not is_inline:
-            context.application.create_task(
-                update.effective_chat.send_action(chat_action, message_thread_id=get_thread_id(update))
-            )
+    while True:
+        # отправляем action
         try:
-            await asyncio.wait_for(asyncio.shield(task), 4.5)
-        except asyncio.TimeoutError:
+            if is_inline and getattr(update, "callback_query", None) and update.callback_query.message:
+                await context.bot.send_chat_action(
+                    chat_id=update.callback_query.message.chat_id,
+                    action=chat_action,
+                )
+            else:
+                await update.effective_chat.send_action(
+                    chat_action,
+                    message_thread_id=get_thread_id(update),  # если у тебя есть эта утилита
+                )
+        except Exception:
+            # проглатываем сетевые мелочи, чтобы индикатор не останавливался
             pass
+
+        # ждём завершения задачи <= interval
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+            # если мы здесь — задача завершилась (успешно). Возвращаем её результат.
+            return result
+        except asyncio.TimeoutError:
+            # не завершилась — крутим следующий цикл и поддаём action
+            continue
+        except Exception:
+            # задача завершилась с ошибкой — пробрасываем её наверх
+            raise
 
 
 async def edit_message_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: int | None,
