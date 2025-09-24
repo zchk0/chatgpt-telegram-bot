@@ -6,10 +6,12 @@ import json
 import logging
 import os
 import base64
+import re
 
 import telegram
 from telegram import Message, MessageEntity, Update, ChatMember, constants
 from telegram.ext import CallbackContext, ContextTypes
+from telegram.helpers import escape_markdown 
 
 from usage_tracker import UsageTracker
 
@@ -435,3 +437,35 @@ def decode_image(imgbase64: str) -> bytes:
     except Exception:
         # best-effort: return empty bytes on bad input
         return b""
+
+async def _reply_text_markdown_check(msg_obj, text: str, parse_mode=None, **kwargs):
+    """
+    If parse_mode is not provided, 
+    auto-enable MarkdownV2 when message looks like markdown
+    """
+    if parse_mode is None:
+        try:
+            looks_like_md = ('```' in text) or re.search(r'[`_*\[\]\(\)~>#+\-=|{}.!]', text) is not None
+        except Exception:
+            looks_like_md = False
+        if looks_like_md:
+            parse_mode = constants.ParseMode.MARKDOWN_V2
+            try:
+                out, last = [], 0
+                for m in re.compile(r"```[ \t]*([\w+-]*)\n([\s\S]*?)\n```", re.MULTILINE).finditer(text):
+                    # вне блока
+                    out.append(escape_markdown(text[last:m.start()], version=2))
+                    # сам блок кода
+                    lang = m.group(1).strip()
+                    code = m.group(2)
+                    out.append(f"```{lang}\n{code}\n```")
+                    last = m.end()
+                out.append(escape_markdown(text[last:], version=2))
+                text = "".join(out)
+            except Exception:
+                pass
+    logging.debug(
+        f"[TG SEND] reply_text parse_mode={parse_mode} len={len(text)}\n"
+        f"----- TEXT -----\n{text}\n----- TEXT -----"
+    )
+    return await msg_obj.reply_text(text=text, parse_mode=parse_mode, **kwargs)

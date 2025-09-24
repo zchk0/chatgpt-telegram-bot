@@ -15,7 +15,6 @@ from telegram import InputTextMessageContent, BotCommand
 from telegram.error import RetryAfter, TimedOut, BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, \
     filters, InlineQueryHandler, CallbackQueryHandler, Application, ContextTypes, CallbackContext
-from telegram.helpers import escape_markdown 
 
 from pydub import AudioSegment
 from PIL import Image
@@ -23,41 +22,9 @@ from PIL import Image
 from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicator, split_into_chunks, \
     edit_message_with_retry, get_stream_cutoff_values, is_allowed, get_remaining_budget, is_admin, is_within_budget, \
     get_reply_to_message_id, add_chat_request_to_usage_tracker, error_handler, is_direct_result, handle_direct_result, \
-    cleanup_intermediate_files
+    cleanup_intermediate_files, _reply_text_markdown_check
 from openai_helper import OpenAIHelper, localized_text
 from usage_tracker import UsageTracker
-
-async def _reply_text_logged(msg_obj, text: str, parse_mode=None, **kwargs):
-    """
-    If parse_mode is not provided, 
-    auto-enable MarkdownV2 when message looks like markdown
-    """
-    if parse_mode is None:
-        try:
-            looks_like_md = ('```' in text) or re.search(r'[`_*\[\]\(\)~>#+\-=|{}.!]', text) is not None
-        except Exception:
-            looks_like_md = False
-        if looks_like_md:
-            parse_mode = constants.ParseMode.MARKDOWN_V2
-            try:
-                out, last = [], 0
-                for m in re.compile(r"```[ \t]*([\w+-]*)\n([\s\S]*?)\n```", re.MULTILINE).finditer(text):
-                    # вне блока
-                    out.append(escape_markdown(text[last:m.start()], version=2))
-                    # сам блок кода
-                    lang = m.group(1).strip()
-                    code = m.group(2)
-                    out.append(f"```{lang}\n{code}\n```")
-                    last = m.end()
-                out.append(escape_markdown(text[last:], version=2))
-                text = "".join(out)
-            except Exception:
-                pass
-    logging.debug(
-        f"[TG SEND] reply_text parse_mode={parse_mode} len={len(text)}\n"
-        f"----- TEXT -----\n{text}\n----- TEXT -----"
-    )
-    return await msg_obj.reply_text(text=text, parse_mode=parse_mode, **kwargs)
 
 class ChatGPTTelegramBot:
     """
@@ -233,7 +200,7 @@ class ChatGPTTelegramBot:
         if chat_id not in self.last_message:
             logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id})'
                             ' does not have anything to resend')
-            await _reply_text_logged(update.effective_message, 
+            await _reply_text_markdown_check(update.effective_message, 
                 message_thread_id=get_thread_id(update),
                 text=localized_text('resend_failed', self.config['bot_language'])
             )
@@ -278,7 +245,7 @@ class ChatGPTTelegramBot:
 
         image_query = message_text(update.message)
         if image_query == '':
-            await _reply_text_logged(update.effective_message, 
+            await _reply_text_markdown_check(update.effective_message, 
                 message_thread_id=get_thread_id(update),
                 text=localized_text('image_no_prompt', self.config['bot_language'])
             )
@@ -311,7 +278,7 @@ class ChatGPTTelegramBot:
 
             except Exception as e:
                 logging.exception(e)
-                await _reply_text_logged(update.effective_message, 
+                await _reply_text_markdown_check(update.effective_message, 
                     message_thread_id=get_thread_id(update),
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=f"{localized_text('image_fail', self.config['bot_language'])}: {str(e)}",
@@ -330,7 +297,7 @@ class ChatGPTTelegramBot:
 
         tts_query = message_text(update.message)
         if tts_query == '':
-            await _reply_text_logged(update.effective_message, 
+            await _reply_text_markdown_check(update.effective_message, 
                 message_thread_id=get_thread_id(update),
                 text=localized_text('tts_no_prompt', self.config['bot_language'])
             )
@@ -357,7 +324,7 @@ class ChatGPTTelegramBot:
 
             except Exception as e:
                 logging.exception(e)
-                await _reply_text_logged(update.effective_message, 
+                await _reply_text_markdown_check(update.effective_message, 
                     message_thread_id=get_thread_id(update),
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=f"{localized_text('tts_fail', self.config['bot_language'])}: {str(e)}",
@@ -388,7 +355,7 @@ class ChatGPTTelegramBot:
                 await media_file.download_to_drive(filename)
             except Exception as e:
                 logging.exception(e)
-                await _reply_text_logged(update.effective_message, 
+                await _reply_text_markdown_check(update.effective_message, 
                     message_thread_id=get_thread_id(update),
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=(
@@ -407,7 +374,7 @@ class ChatGPTTelegramBot:
 
             except Exception as e:
                 logging.exception(e)
-                await _reply_text_logged(update.effective_message, 
+                await _reply_text_markdown_check(update.effective_message, 
                     message_thread_id=get_thread_id(update),
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=localized_text('media_type_fail', bot_language)
@@ -441,7 +408,7 @@ class ChatGPTTelegramBot:
                     chunks = split_into_chunks(transcript_output)
 
                     for index, transcript_chunk in enumerate(chunks):
-                        await _reply_text_logged(update.effective_message, 
+                        await _reply_text_markdown_check(update.effective_message, 
                             message_thread_id=get_thread_id(update),
                             reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
                             text=transcript_chunk,
@@ -463,7 +430,7 @@ class ChatGPTTelegramBot:
                     chunks = split_into_chunks(transcript_output)
 
                     for index, transcript_chunk in enumerate(chunks):
-                        await _reply_text_logged(update.effective_message, 
+                        await _reply_text_markdown_check(update.effective_message, 
                             message_thread_id=get_thread_id(update),
                             reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
                             text=transcript_chunk,
@@ -472,7 +439,7 @@ class ChatGPTTelegramBot:
 
             except Exception as e:
                 logging.exception(e)
-                await _reply_text_logged(update.effective_message, 
+                await _reply_text_markdown_check(update.effective_message, 
                     message_thread_id=get_thread_id(update),
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=f"{localized_text('transcribe_fail', bot_language)}: {str(e)}",
@@ -518,7 +485,7 @@ class ChatGPTTelegramBot:
                 temp_file = io.BytesIO(await media_file.download_as_bytearray())
             except Exception as e:
                 logging.exception(e)
-                await _reply_text_logged(update.effective_message, 
+                await _reply_text_markdown_check(update.effective_message, 
                     message_thread_id=get_thread_id(update),
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=(
@@ -542,7 +509,7 @@ class ChatGPTTelegramBot:
 
             except Exception as e:
                 logging.exception(e)
-                await _reply_text_logged(update.effective_message, 
+                await _reply_text_markdown_check(update.effective_message, 
                     message_thread_id=get_thread_id(update),
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=localized_text('media_type_fail', bot_language)
@@ -581,7 +548,7 @@ class ChatGPTTelegramBot:
                             except:
                                 pass
                             try:
-                                sent_message = await _reply_text_logged(update.effective_message, 
+                                sent_message = await _reply_text_markdown_check(update.effective_message, 
                                     message_thread_id=get_thread_id(update),
                                     text=content if len(content) > 0 else "..."
                                 )
@@ -597,7 +564,7 @@ class ChatGPTTelegramBot:
                             if sent_message is not None:
                                 await context.bot.delete_message(chat_id=sent_message.chat_id,
                                                                  message_id=sent_message.message_id)
-                            sent_message = await _reply_text_logged(update.effective_message, 
+                            sent_message = await _reply_text_markdown_check(update.effective_message, 
                                 message_thread_id=get_thread_id(update),
                                 reply_to_message_id=get_reply_to_message_id(self.config, update),
                                 text=content,
@@ -642,7 +609,7 @@ class ChatGPTTelegramBot:
 
 
                     try:
-                        await _reply_text_logged(update.effective_message, 
+                        await _reply_text_markdown_check(update.effective_message, 
                             message_thread_id=get_thread_id(update),
                             reply_to_message_id=get_reply_to_message_id(self.config, update),
                             text=interpretation,
@@ -650,14 +617,14 @@ class ChatGPTTelegramBot:
                         )
                     except BadRequest:
                         try:
-                            await _reply_text_logged(update.effective_message, 
+                            await _reply_text_markdown_check(update.effective_message, 
                                 message_thread_id=get_thread_id(update),
                                 reply_to_message_id=get_reply_to_message_id(self.config, update),
                                 text=interpretation
                             )
                         except Exception as e:
                             logging.exception(e)
-                            await _reply_text_logged(update.effective_message, 
+                            await _reply_text_markdown_check(update.effective_message, 
                                 message_thread_id=get_thread_id(update),
                                 reply_to_message_id=get_reply_to_message_id(self.config, update),
                                 text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
@@ -665,7 +632,7 @@ class ChatGPTTelegramBot:
                             )
                 except Exception as e:
                     logging.exception(e)
-                    await _reply_text_logged(update.effective_message, 
+                    await _reply_text_markdown_check(update.effective_message, 
                         message_thread_id=get_thread_id(update),
                         reply_to_message_id=get_reply_to_message_id(self.config, update),
                         text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
@@ -756,7 +723,7 @@ class ChatGPTTelegramBot:
                                 except:
                                     pass
                                 try:
-                                    sent_message = await _reply_text_logged(update.effective_message, 
+                                    sent_message = await _reply_text_markdown_check(update.effective_message, 
                                         message_thread_id=get_thread_id(update),
                                         text=content if len(content) > 0 else "."
                                     )
@@ -771,7 +738,7 @@ class ChatGPTTelegramBot:
                                 if sent_message is not None:
                                     await context.bot.delete_message(chat_id=sent_message.chat_id,
                                                                     message_id=sent_message.message_id)
-                                sent_message = await _reply_text_logged(update.effective_message, 
+                                sent_message = await _reply_text_markdown_check(update.effective_message, 
                                     message_thread_id=get_thread_id(update),
                                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                                     text=content,
@@ -823,7 +790,7 @@ class ChatGPTTelegramBot:
 
                     for index, chunk in enumerate(chunks):
                         try:
-                            await _reply_text_logged(update.effective_message, 
+                            await _reply_text_markdown_check(update.effective_message, 
                                 message_thread_id=get_thread_id(update),
                                 reply_to_message_id=get_reply_to_message_id(self.config,
                                                                             update) if index == 0 else None,
@@ -832,7 +799,7 @@ class ChatGPTTelegramBot:
                             )
                         except Exception:
                             try:
-                                await _reply_text_logged(update.effective_message, 
+                                await _reply_text_markdown_check(update.effective_message, 
                                     message_thread_id=get_thread_id(update),
                                     reply_to_message_id=get_reply_to_message_id(self.config,
                                                                                 update) if index == 0 else None,
@@ -848,7 +815,7 @@ class ChatGPTTelegramBot:
         except Exception as e:
             logging.error(f'Failed to respond to a message: {e}')
             logging.exception(e)
-            await _reply_text_logged(update.effective_message, 
+            await _reply_text_markdown_check(update.effective_message, 
                 message_thread_id=get_thread_id(update),
                 reply_to_message_id=get_reply_to_message_id(self.config, update),
                 text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
@@ -1069,7 +1036,7 @@ class ChatGPTTelegramBot:
         Sends the disallowed message to the user.
         """
         if not is_inline:
-            await _reply_text_logged(update.effective_message, 
+            await _reply_text_markdown_check(update.effective_message, 
                 message_thread_id=get_thread_id(update),
                 text=self.disallowed_message,
                 disable_web_page_preview=True
@@ -1083,7 +1050,7 @@ class ChatGPTTelegramBot:
         Sends the budget reached message to the user.
         """
         if not is_inline:
-            await _reply_text_logged(update.effective_message, 
+            await _reply_text_markdown_check(update.effective_message, 
                 message_thread_id=get_thread_id(update),
                 text=self.budget_limit_message
             )
