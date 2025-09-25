@@ -232,7 +232,7 @@ class OpenAIHelper:
         :param chat_id: The chat ID
         :param query: The query to send to the model
         :param params: Additional parameters as a dictionary
-        :return: The answer from the model and the number of tokens used, or 'not_finished'
+        :return: Yields (partial_text, 'not_finished') during stream and (final_text, tokens_used) at the end.
         """
         self.current_telegram_chat_id = chat_id
         self.current_telegram_user_id = params.get('telegram_user_id', 0)
@@ -247,6 +247,7 @@ class OpenAIHelper:
         # Авто-выход из vision при первом текстовом запросе
         await self.__auto_exit_vision_if_needed(chat_id)
 
+        # Определяем модель и режим стрима
         effective_model = self.config['model'] if not self.conversations_vision.get(chat_id, False) else self.config['vision_model']
         want_stream = params.get("want_stream", True)
         if effective_model in REASONING_MODELS:
@@ -263,45 +264,151 @@ class OpenAIHelper:
             else:
                 raise
 
-        if (self.config['enable_functions'] or self.config.get('enable_tools', True)):
-            response, plugins_used = await self.__handle_function_or_tool_call(chat_id, response, stream=streaming)
+        tools_enabled = (self.config.get('enable_functions') or self.config.get('enable_tools', True))
+        if streaming:
+            answer = ""
+            added_to_history = False
+            # Аккумуляторы для tool_calls / function_call (старый стиль)
+            tool_calls_acc = []
+            function_call_acc = None
+            saw_tools = False
+
+            async for chunk in response:
+                if not getattr(chunk, "choices", None) or len(chunk.choices) == 0:
+                    continue
+                ch = chunk.choices[0]
+                delta = getattr(ch, "delta", None)
+
+                # Обычные текстовые дельты — отдаём пользователю сразу
+                if delta is not None and getattr(delta, "content", None):
+                    if not saw_tools:
+                        answer += delta.content
+                        yield answer, 'not_finished'
+
+                # Новый стиль tools: delta.tool_calls
+                if delta is not None and getattr(delta, "tool_calls", None):
+                    saw_tools = True
+                    for tc in delta.tool_calls:
+                        # расширяем список под индекс
+                        while len(tool_calls_acc) <= tc.index:
+                            tool_calls_acc.append({"id": None, "function": {"name": "", "arguments": ""}})
+                        if getattr(tc, "id", None):
+                            tool_calls_acc[tc.index]["id"] = tc.id
+                        fn = getattr(tc, "function", None)
+                        if fn:
+                            if getattr(fn, "name", None):
+                                tool_calls_acc[tc.index]["function"]["name"] += fn.name
+                            if getattr(fn, "arguments", None):
+                                tool_calls_acc[tc.index]["function"]["arguments"] += fn.arguments
+
+                # Старый стиль функций: delta.function_call
+                if delta is not None and getattr(delta, "function_call", None):
+                    saw_tools = True
+                    if getattr(delta.function_call, "name", None):
+                        function_call_acc = function_call_acc or {"name": "", "arguments": ""}
+                        function_call_acc["name"] += delta.function_call.name
+                    if getattr(delta.function_call, "arguments", None):
+                        function_call_acc = function_call_acc or {"name": "", "arguments": ""}
+                        function_call_acc["arguments"] += delta.function_call.arguments
+
+                # Сигнал завершения шага: tool_calls / function_call → пора вызывать инструменты
+                finish = getattr(ch, "finish_reason", None)
+                if tools_enabled and finish in ("tool_calls", "function_call"):
+                    break
+
+            # Если инструментов не было — обычный стрим без tools
+            if not (tools_enabled and (tool_calls_acc or function_call_acc)):
+                final_text = answer.strip()
+                if final_text:
+                    self.__add_to_history(chat_id, role="assistant", content=final_text)
+                    added_to_history = True
+
+                tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+                # show_usage / плагины (если были из предыдущих шагов — маловероятно в этой ветке)
+                show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
+                plugin_names = tuple(set(self.plugin_manager.get_plugin_source_name(p) for p in plugins_used))
+                if self.config['show_usage']:
+                    final_text += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+                    if show_plugins_used:
+                        final_text += f"\n🔌 {', '.join(plugin_names)}"
+                elif show_plugins_used:
+                    final_text += f"\n\n---\n🔌 {', '.join(plugin_names)}"
+
+                yield final_text, tokens_used
+                return
+
+            # ==== Ветка с tools ====
+            # Делаем обработку инструментов НЕстримово (чтобы заполнить историю правильными сообщениями tool/assistant)
+            # __handle_function_or_tool_call сама дочитает необходимые данные из response, добавит tool ответы и при необходимости
+            # подготовит историю для follow-up запроса.
+            resp_after_tools, plugins_used = await self.__handle_function_or_tool_call(
+                chat_id, response, stream=False, times=0, plugins_used=()
+            )
+            if is_direct_result(resp_after_tools):
+                # Прямой результат плагина (файл, фото, dice ...)
+                yield resp_after_tools, '0'
+                return
+
+            # Follow-up запрос после инструментов — уже стримим финальный текст
+            m = self.config['model'] if not self.conversations_vision.get(chat_id, False) else self.config['vision_model']
+            max_key = 'max_completion_tokens' if m in REASONING_MODELS else 'max_tokens'
+            followup = await self.client.chat.completions.create(
+                model=m,
+                messages=self.conversations[chat_id],
+                **{max_key: self.config['max_tokens']},
+                stream=True
+            )
+
+            followup_answer = ""
+            async for ch2 in followup:
+                if not getattr(ch2, "choices", None) or len(ch2.choices) == 0:
+                    continue
+                d = getattr(ch2.choices[0], "delta", None)
+                if d is not None and getattr(d, "content", None):
+                    followup_answer += d.content
+                    # Стримим уже «пост-инструментальный» текст; до этого могли быть прелюдии в answer
+                    out = (answer + followup_answer) if answer else followup_answer
+                    yield out, 'not_finished'
+
+            final_text = ((answer + followup_answer) if answer else followup_answer).strip()
+            if final_text:
+                self.__add_to_history(chat_id, role="assistant", content=final_text)
+
+            tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+            show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
+            plugin_names = tuple(set(self.plugin_manager.get_plugin_source_name(p) for p in plugins_used))
+            if self.config['show_usage']:
+                final_text += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+                if show_plugins_used:
+                    final_text += f"\n🔌 {', '.join(plugin_names)}"
+            elif show_plugins_used:
+                final_text += f"\n\n---\n🔌 {', '.join(plugin_names)}"
+
+            yield final_text, tokens_used
+            return
+
+        if tools_enabled:
+            response, plugins_used = await self.__handle_function_or_tool_call(chat_id, response, stream=False)
             if is_direct_result(response):
                 yield response, '0'
                 return
 
+        # Сборка полноразмерного ответа без стрима
         answer = ''
-        added_to_history = False
-        if streaming:
-            async for chunk in response:
-                if len(chunk.choices) == 0:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    answer += delta.content
-                    yield answer, 'not_finished'
-            answer = answer.strip()
-            self.__add_to_history(chat_id, role="assistant", content=answer)
-            added_to_history = True
+        if len(response.choices) > 1 and self.config['n_choices'] > 1:
+            for index, choice in enumerate(response.choices):
+                content = (choice.message.content or "").strip()
+                if index == 0:
+                    self.__add_to_history(chat_id, role="assistant", content=content)
+                answer += f'{index + 1}\u20e3\n{content}\n\n'
         else:
-            if len(response.choices) > 1 and self.config['n_choices'] > 1:
-                for index, choice in enumerate(response.choices):
-                    content = choice.message.content.strip()
-                    if index == 0:
-                        self.__add_to_history(chat_id, role="assistant", content=content)
-                        added_to_history = True
-                    answer += f'{index + 1}\u20e3\n{content}\n\n'
-            else:
-                answer = response.choices[0].message.content.strip()
-                self.__add_to_history(chat_id, role="assistant", content=answer)
-                added_to_history = True
-
-        if not added_to_history and answer:
+            answer = (response.choices[0].message.content or "").strip()
             self.__add_to_history(chat_id, role="assistant", content=answer)
 
         tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
 
         show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
-        plugin_names = tuple(set(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used))
+        plugin_names = tuple(set(self.plugin_manager.get_plugin_source_name(p) for p in plugins_used))
         if self.config['show_usage']:
             answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
             if show_plugins_used:
