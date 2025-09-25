@@ -141,11 +141,27 @@ async def edit_message_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: i
     :return: None
     """
     try:
+        try:
+            out, last = [], 0
+            fence = re.compile(r"```[ \t]*([\w+-]*)\n([\s\S]*?)\n```", re.MULTILINE)
+            for m in fence.finditer(text):
+                # вне блока — экранируем
+                out.append(escape_markdown(text[last:m.start()], version=2))
+                lang = (m.group(1) or "").strip()
+                code = m.group(2)
+                out.append(f"```{lang}\n{code}\n```")
+                last = m.end()
+            out.append(escape_markdown(text[last:], version=2))
+            safe_text = "".join(out)
+        except Exception:
+            # в худшем случае — полное экранирование
+            safe_text = escape_markdown(text, version=2)
+
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=int(message_id) if not is_inline else None,
             inline_message_id=message_id if is_inline else None,
-            text=text,
+            text=safe_text,
             parse_mode=constants.ParseMode.MARKDOWN_V2 if markdown else None,
         )
     except telegram.error.BadRequest as e:
